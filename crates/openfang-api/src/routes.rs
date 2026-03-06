@@ -540,6 +540,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     Json(serde_json::json!({
         "status": "running",
+        "version": env!("CARGO_PKG_VERSION"),
         "agent_count": agent_count,
         "default_provider": state.kernel.config.default_model.provider,
         "default_model": state.kernel.config.default_model.model,
