@@ -11,7 +11,8 @@ RUN cargo build --release --bin openfang
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates curl git ffmpeg python3 python3-pip gosu sudo procps build-essential jq && rm -rf /var/lib/apt/lists/*
-RUN pip3 install --break-system-packages playwright && playwright install --with-deps chromium
+RUN ln -s /usr/bin/python3 /usr/bin/python && \
+    pip3 install --break-system-packages playwright && playwright install --with-deps chromium
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN (type -p wget >/dev/null || (apt-get update && apt-get install -y wget)) && \
     mkdir -p -m 755 /etc/apt/keyrings && \
