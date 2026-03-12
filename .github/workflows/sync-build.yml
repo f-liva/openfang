@@ -17,6 +17,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
+      - name: Notify Telegram (start)
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="🚀 *OpenFang Build Started*%0A%0ATrigger: \`${{ github.event_name }}\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
       - name: Fetch upstream tags
         if: github.event_name != 'push'
         run: |
