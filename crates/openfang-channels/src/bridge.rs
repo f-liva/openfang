@@ -434,6 +434,29 @@ async fn send_lifecycle_reaction(
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
 
+/// Build a contextual prefix when the user is replying to a previous message.
+///
+/// Returns `Some("[Replying to <sender>: <text>]\n\n")` if reply metadata exists.
+fn build_reply_context(metadata: &std::collections::HashMap<String, serde_json::Value>) -> Option<String> {
+    // Need at least some quoted content
+    let quoted = metadata
+        .get("reply_to_text")
+        .and_then(|v| v.as_str())
+        .or_else(|| metadata.get("reply_to_caption").and_then(|v| v.as_str()));
+    let quoted = quoted?;
+    let sender = metadata
+        .get("reply_to_sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    // Truncate very long quoted messages to keep context manageable
+    let truncated = if quoted.len() > 500 {
+        format!("{}…", &quoted[..500])
+    } else {
+        quoted.to_string()
+    };
+    Some(format!("[Replying to {sender}: {truncated}]\n\n"))
+}
+
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
@@ -530,8 +553,15 @@ async fn dispatch_message(
 
     // For images: download, base64 encode, and send as multimodal content blocks
     if let ChannelContent::Image { ref url, ref caption } = message.content {
-        let blocks = download_image_to_blocks(url, caption.as_deref()).await;
+        let mut blocks = download_image_to_blocks(url, caption.as_deref()).await;
         if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) {
+            // Prepend reply context if this is a reply to a previous message
+            if let Some(reply_ctx) = build_reply_context(&message.metadata) {
+                blocks.insert(0, ContentBlock::Text {
+                    text: reply_ctx,
+                    provider_metadata: None,
+                });
+            }
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
@@ -571,6 +601,12 @@ async fn dispatch_message(
         ChannelContent::FileData { ref filename, .. } => {
             format!("[User sent a local file: {filename}]")
         }
+    };
+
+    // Prepend reply context if this is a reply to a previous message
+    let text = match build_reply_context(&message.metadata) {
+        Some(ctx) => format!("{ctx}{text}"),
+        None => text,
     };
 
     // Check if it's a slash command embedded in text (e.g. "/agents")
