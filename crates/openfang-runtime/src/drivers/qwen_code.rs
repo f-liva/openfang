@@ -12,8 +12,8 @@ use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-/// Environment variable names to strip from the subprocess to prevent
-/// leaking API keys from other providers.
+/// Environment variable names (and suffixes) to strip from the subprocess
+/// to prevent leaking API keys from other providers.
 const SENSITIVE_ENV_EXACT: &[&str] = &[
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -87,23 +87,37 @@ impl QwenCodeDriver {
         }
     }
 
-    /// Build the CLI arguments for a given request.
-    pub fn build_args(&self, prompt: &str, model: &str, streaming: bool) -> Vec<String> {
-        let mut args = vec!["-p".to_string(), prompt.to_string()];
+    /// Build the CLI argument list for a completion request.
+    ///
+    /// Exposed as a testable method so unit tests can verify that `--yolo`,
+    /// `--model`, and output format flags are set correctly.
+    pub fn build_args(
+        &self,
+        prompt: &str,
+        model: &str,
+        streaming: bool,
+    ) -> Vec<String> {
+        let model_flag = Self::model_flag(model);
 
-        args.push("--output-format".to_string());
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+            "--output-format".to_string(),
+            if streaming {
+                "stream-json".to_string()
+            } else {
+                "json".to_string()
+            },
+        ];
+
         if streaming {
-            args.push("stream-json".to_string());
             args.push("--verbose".to_string());
-        } else {
-            args.push("json".to_string());
         }
 
         if self.skip_permissions {
             args.push("--yolo".to_string());
         }
 
-        let model_flag = Self::model_flag(model);
         if let Some(ref m) = model_flag {
             args.push("--model".to_string());
             args.push(m.clone());
@@ -147,10 +161,15 @@ impl QwenCodeDriver {
     }
 
     /// Apply security env filtering to a command.
+    ///
+    /// Instead of `env_clear()` (which breaks Node.js, NVM, SSL, proxies),
+    /// we keep the full environment and only remove known sensitive API keys
+    /// from other LLM providers.
     fn apply_env_filter(cmd: &mut tokio::process::Command) {
         for key in SENSITIVE_ENV_EXACT {
             cmd.env_remove(key);
         }
+        // Remove any env var with a sensitive suffix, unless it's QWEN_*
         for (key, _) in std::env::vars() {
             if key.starts_with("QWEN_") {
                 continue;
@@ -167,6 +186,9 @@ impl QwenCodeDriver {
 }
 
 /// JSON output from `qwen -p --output-format json`.
+///
+/// The CLI may return the response text in different fields depending on
+/// version: `result`, `content`, or `text`. We try all three.
 #[derive(Debug, Deserialize)]
 struct QwenJsonOutput {
     result: Option<String>,
@@ -213,9 +235,7 @@ impl LlmDriver for QwenCodeDriver {
         let args = self.build_args(&prompt, &request.model, false);
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
-        for arg in &args {
-            cmd.arg(arg);
-        }
+        cmd.args(&args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -239,6 +259,7 @@ impl LlmDriver for QwenCodeDriver {
             let detail = if !stderr.is_empty() { &stderr } else { &stdout };
             let code = output.status.code().unwrap_or(1);
 
+            // Provide actionable error messages
             let message = if detail.contains("not authenticated")
                 || detail.contains("auth")
                 || detail.contains("login")
@@ -246,6 +267,13 @@ impl LlmDriver for QwenCodeDriver {
             {
                 format!(
                     "Qwen Code CLI is not authenticated. Run: qwen auth\nDetail: {detail}"
+                )
+            } else if detail.contains("permission")
+                || detail.contains("--yolo")
+            {
+                format!(
+                    "Qwen Code CLI requires permissions acceptance. \
+                     Run: qwen --yolo (once to accept)\nDetail: {detail}"
                 )
             } else {
                 format!("Qwen Code CLI exited with code {code}: {detail}")
@@ -259,9 +287,9 @@ impl LlmDriver for QwenCodeDriver {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
+        // Try JSON parse first
         if let Ok(parsed) = serde_json::from_str::<QwenJsonOutput>(&stdout) {
-            let text = parsed
-                .result
+            let text = parsed.result
                 .or(parsed.content)
                 .or(parsed.text)
                 .unwrap_or_default();
@@ -280,6 +308,7 @@ impl LlmDriver for QwenCodeDriver {
             });
         }
 
+        // Fallback: treat entire stdout as plain text
         let text = stdout.trim().to_string();
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
@@ -304,9 +333,7 @@ impl LlmDriver for QwenCodeDriver {
         let args = self.build_args(&prompt, &request.model, true);
 
         let mut cmd = tokio::process::Command::new(&self.cli_path);
-        for arg in &args {
-            cmd.arg(arg);
-        }
+        cmd.args(&args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -343,47 +370,51 @@ impl LlmDriver for QwenCodeDriver {
             }
 
             match serde_json::from_str::<QwenStreamEvent>(&line) {
-                Ok(event) => match event.r#type.as_str() {
-                    "content" | "text" | "assistant" | "content_block_delta" => {
-                        if let Some(ref content) = event.content {
-                            full_text.push_str(content);
-                            let _ = tx
-                                .send(StreamEvent::TextDelta {
-                                    text: content.clone(),
-                                })
-                                .await;
-                        }
-                    }
-                    "result" | "done" | "complete" => {
-                        if let Some(ref result) = event.result {
-                            if full_text.is_empty() {
-                                full_text = result.clone();
+                Ok(event) => {
+                    match event.r#type.as_str() {
+                        "content" | "text" | "assistant" | "content_block_delta" => {
+                            if let Some(ref content) = event.content {
+                                full_text.push_str(content);
                                 let _ = tx
                                     .send(StreamEvent::TextDelta {
-                                        text: result.clone(),
+                                        text: content.clone(),
                                     })
                                     .await;
                             }
                         }
-                        if let Some(usage) = event.usage {
-                            final_usage = TokenUsage {
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                            };
+                        "result" | "done" | "complete" => {
+                            if let Some(ref result) = event.result {
+                                if full_text.is_empty() {
+                                    full_text = result.clone();
+                                    let _ = tx
+                                        .send(StreamEvent::TextDelta {
+                                            text: result.clone(),
+                                        })
+                                        .await;
+                                }
+                            }
+                            if let Some(usage) = event.usage {
+                                final_usage = TokenUsage {
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                };
+                            }
+                        }
+                        _ => {
+                            // Unknown event type — try content field as fallback
+                            if let Some(ref content) = event.content {
+                                full_text.push_str(content);
+                                let _ = tx
+                                    .send(StreamEvent::TextDelta {
+                                        text: content.clone(),
+                                    })
+                                    .await;
+                            }
                         }
                     }
-                    _ => {
-                        if let Some(ref content) = event.content {
-                            full_text.push_str(content);
-                            let _ = tx
-                                .send(StreamEvent::TextDelta {
-                                    text: content.clone(),
-                                })
-                                .await;
-                        }
-                    }
-                },
+                }
                 Err(e) => {
+                    // Not valid JSON — treat as raw text
                     warn!(line = %line, error = %e, "Non-JSON line from Qwen CLI");
                     full_text.push_str(&line);
                     let _ = tx
@@ -393,6 +424,7 @@ impl LlmDriver for QwenCodeDriver {
             }
         }
 
+        // Wait for process to finish
         let status = child
             .wait()
             .await
@@ -421,18 +453,22 @@ impl LlmDriver for QwenCodeDriver {
     }
 }
 
-/// Check if the Qwen Code CLI is available.
+/// Check if the Qwen Code CLI is available and authenticated.
 pub fn qwen_code_available() -> bool {
     QwenCodeDriver::detect().is_some() || qwen_credentials_exist()
 }
 
 /// Check if Qwen credentials exist.
+///
+/// Qwen Code stores session/credentials in `~/.qwen` or `~/.qwen-code/` directory.
 fn qwen_credentials_exist() -> bool {
     if let Some(home) = home_dir() {
         let qwen_dir = home.join(".qwen");
+        let qwen_code_dir = home.join(".qwen-code");
         qwen_dir.join("credentials.json").exists()
             || qwen_dir.join(".credentials.json").exists()
             || qwen_dir.join("auth.json").exists()
+            || qwen_code_dir.exists()
     } else {
         false
     }
@@ -480,6 +516,39 @@ mod tests {
         assert!(prompt.contains("You are helpful."));
         assert!(prompt.contains("[User]"));
         assert!(prompt.contains("Hello"));
+    }
+
+    #[test]
+    fn test_build_prompt_multi_turn() {
+        use openfang_types::message::{Message, MessageContent};
+
+        let request = CompletionRequest {
+            model: "qwen-code/qwen3-coder".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::text("What is 2+2?"),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::text("4"),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::text("And 3+3?"),
+                },
+            ],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.7,
+            system: None,
+            thinking: None,
+        };
+
+        let prompt = QwenCodeDriver::build_prompt(&request);
+        assert!(prompt.contains("[User]\nWhat is 2+2?"));
+        assert!(prompt.contains("[Assistant]\n4"));
+        assert!(prompt.contains("[User]\nAnd 3+3?"));
     }
 
     #[test]
@@ -532,28 +601,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sensitive_env_list_coverage() {
-        assert!(SENSITIVE_ENV_EXACT.contains(&"OPENAI_API_KEY"));
-        assert!(SENSITIVE_ENV_EXACT.contains(&"ANTHROPIC_API_KEY"));
-        assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
-        assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
-        assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
-    }
-
-    #[test]
     fn test_build_args_with_yolo() {
         let driver = QwenCodeDriver::new(None, true);
         let args = driver.build_args("test prompt", "qwen-code/qwen3-coder", false);
-        assert!(args.contains(&"--yolo".to_string()));
+        assert!(args.contains(&"--yolo".to_string()), "should contain --yolo when skip_permissions=true");
         assert!(args.contains(&"json".to_string()));
         assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"qwen3-coder".to_string()));
     }
 
     #[test]
     fn test_build_args_without_yolo() {
         let driver = QwenCodeDriver::new(None, false);
         let args = driver.build_args("test prompt", "qwen-code/qwen3-coder", false);
-        assert!(!args.contains(&"--yolo".to_string()));
+        assert!(!args.contains(&"--yolo".to_string()), "should NOT contain --yolo when skip_permissions=false");
     }
 
     #[test]
@@ -562,6 +623,15 @@ mod tests {
         let args = driver.build_args("test prompt", "qwen-code/qwen3-coder", true);
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn test_sensitive_env_list_coverage() {
+        assert!(SENSITIVE_ENV_EXACT.contains(&"OPENAI_API_KEY"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"ANTHROPIC_API_KEY"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
+        assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
     }
 
     #[test]

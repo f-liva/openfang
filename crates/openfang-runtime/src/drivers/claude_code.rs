@@ -125,6 +125,42 @@ impl ClaudeCodeDriver {
         }
     }
 
+    /// Build the CLI argument list for a completion request.
+    ///
+    /// Exposed as a testable method so unit tests can verify that
+    /// `--dangerously-skip-permissions`, `--model`, and output format flags
+    /// are set correctly.
+    fn build_args(
+        &self,
+        prompt: &str,
+        model_flag: Option<&str>,
+        streaming: bool,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+        ];
+
+        if self.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        args.push("--output-format".to_string());
+        if streaming {
+            args.push("stream-json".to_string());
+            args.push("--verbose".to_string());
+        } else {
+            args.push("json".to_string());
+        }
+
+        if let Some(model) = model_flag {
+            args.push("--model".to_string());
+            args.push(model.to_string());
+        }
+
+        args
+    }
+
     /// Apply security env filtering to a command.
     ///
     /// Instead of `env_clear()` (which breaks Node.js, NVM, SSL, proxies),
@@ -199,20 +235,10 @@ impl LlmDriver for ClaudeCodeDriver {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
+        let args = self.build_args(&prompt, model_flag.as_deref(), false);
+
         let mut cmd = tokio::process::Command::new(&self.cli_path);
-        cmd.arg("-p")
-            .arg(&prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("json");
-
-        if self.skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
-        if let Some(ref model) = model_flag {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.args(&args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -303,21 +329,10 @@ impl LlmDriver for ClaudeCodeDriver {
         let prompt = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);
 
+        let args = self.build_args(&prompt, model_flag.as_deref(), true);
+
         let mut cmd = tokio::process::Command::new(&self.cli_path);
-        cmd.arg("-p")
-            .arg(&prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
-
-        if self.skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
-        if let Some(ref model) = model_flag {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.args(&args);
 
         Self::apply_env_filter(&mut cmd);
 
@@ -538,6 +553,34 @@ mod tests {
     fn test_skip_permissions_disabled() {
         let driver = ClaudeCodeDriver::new(None, false);
         assert!(!driver.skip_permissions);
+    }
+
+    #[test]
+    fn test_build_args_with_skip_permissions() {
+        let driver = ClaudeCodeDriver::new(None, true);
+        let args = driver.build_args("hello", Some("opus"), false);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()),
+            "should contain --dangerously-skip-permissions when skip_permissions=true");
+        assert!(args.contains(&"json".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"opus".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_without_skip_permissions() {
+        let driver = ClaudeCodeDriver::new(None, false);
+        let args = driver.build_args("hello", Some("sonnet"), false);
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()),
+            "should NOT contain --dangerously-skip-permissions when skip_permissions=false");
+    }
+
+    #[test]
+    fn test_build_args_streaming() {
+        let driver = ClaudeCodeDriver::new(None, true);
+        let args = driver.build_args("hello", None, true);
+        assert!(args.contains(&"stream-json".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
+        assert!(!args.contains(&"--model".to_string()), "no model flag when model_flag is None");
     }
 
     #[test]

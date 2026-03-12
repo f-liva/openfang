@@ -78,6 +78,19 @@ impl ModelCatalog {
                 continue;
             }
 
+            // Qwen Code: detect CLI installation + authentication
+            if provider.id == "qwen-code" {
+                let cli_installed = crate::drivers::qwen_code::QwenCodeDriver::detect().is_some();
+                if cli_installed && crate::drivers::qwen_code::qwen_code_available() {
+                    provider.auth_status = AuthStatus::Configured;
+                } else if cli_installed {
+                    provider.auth_status = AuthStatus::Missing;
+                } else {
+                    provider.auth_status = AuthStatus::NotRequired;
+                }
+                continue;
+            }
+
             if !provider.key_required {
                 provider.auth_status = AuthStatus::NotRequired;
                 continue;
@@ -850,8 +863,11 @@ fn builtin_aliases() -> HashMap<String, String> {
         // Qwen Code aliases
         ("qwen-code", "qwen-code/qwen3-coder"),
         ("qwen-coder", "qwen-code/qwen3-coder"),
+        ("qwen-code-qwen3", "qwen-code/qwen3-coder"),
         ("qwen-coder-plus", "qwen-code/qwen-coder-plus"),
+        ("qwen-code-plus", "qwen-code/qwen-coder-plus"),
         ("qwq", "qwen-code/qwq-32b"),
+        ("qwen-code-qwq", "qwen-code/qwq-32b"),
     ];
     pairs
         .into_iter()
@@ -3457,20 +3473,6 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
         // Qwen Code CLI (3) — subprocess-based, free via Qwen OAuth
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
-            id: "qwen-code/qwen-coder-plus".into(),
-            display_name: "Qwen Coder Plus (CLI)".into(),
-            provider: "qwen-code".into(),
-            tier: ModelTier::Frontier,
-            context_window: 131_072,
-            max_output_tokens: 65_536,
-            input_cost_per_m: 0.0,
-            output_cost_per_m: 0.0,
-            supports_tools: false,
-            supports_vision: false,
-            supports_streaming: true,
-            aliases: vec!["qwen-coder-plus".into()],
-        },
-        ModelCatalogEntry {
             id: "qwen-code/qwen3-coder".into(),
             display_name: "Qwen3 Coder (CLI)".into(),
             provider: "qwen-code".into(),
@@ -3482,7 +3484,21 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: true,
-            aliases: vec!["qwen-code".into(), "qwen-coder".into()],
+            aliases: vec!["qwen-code".into(), "qwen-coder".into(), "qwen-code-qwen3".into()],
+        },
+        ModelCatalogEntry {
+            id: "qwen-code/qwen-coder-plus".into(),
+            display_name: "Qwen Coder Plus (CLI)".into(),
+            provider: "qwen-code".into(),
+            tier: ModelTier::Frontier,
+            context_window: 131_072,
+            max_output_tokens: 65_536,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: false,
+            supports_vision: false,
+            supports_streaming: true,
+            aliases: vec!["qwen-coder-plus".into(), "qwen-code-plus".into()],
         },
         ModelCatalogEntry {
             id: "qwen-code/qwq-32b".into(),
@@ -3496,7 +3512,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             supports_tools: false,
             supports_vision: false,
             supports_streaming: true,
-            aliases: vec!["qwq".into()],
+            aliases: vec!["qwq".into(), "qwen-code-qwq".into()],
         },
         // ══════════════════════════════════════════════════════════════
         // Chutes.ai (5)

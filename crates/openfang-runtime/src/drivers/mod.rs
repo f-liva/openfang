@@ -151,6 +151,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "",
             key_required: false,
         }),
+        "qwen-code" => Some(ProviderDefaults {
+            base_url: "",
+            api_key_env: "",
+            key_required: false,
+        }),
         "moonshot" | "kimi" | "kimi2" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
@@ -421,7 +426,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             chutes, venice, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             chutes, venice, codex, claude-code, qwen-code. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
