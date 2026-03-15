@@ -403,17 +403,24 @@ pub async fn send_message(
             // Strip <think>...</think> blocks from model output
             let cleaned = crate::ws::strip_think_tags(&result.response);
 
-            // Guard: ensure we never return an empty response to the client
-            let response = if cleaned.trim().is_empty() {
-                format!(
-                    "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
-                    result.total_usage.input_tokens,
-                    result.total_usage.output_tokens,
-                    result.iterations,
-                )
-            } else {
-                cleaned
-            };
+            // If the agent intentionally chose not to reply (NO_REPLY / [[silent]]),
+            // OR if the response is empty after stripping <think> tags (agent only
+            // produced internal reasoning), treat as silent — never leak debug info.
+            if result.silent || cleaned.trim().is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!(MessageResponse {
+                        response: String::new(),
+                        input_tokens: result.total_usage.input_tokens,
+                        output_tokens: result.total_usage.output_tokens,
+                        iterations: result.iterations,
+                        cost_usd: result.cost_usd,
+                        silent: true,
+                    })),
+                );
+            }
+
+            let response = cleaned;
             (
                 StatusCode::OK,
                 Json(serde_json::json!(MessageResponse {
@@ -422,6 +429,7 @@ pub async fn send_message(
                     output_tokens: result.total_usage.output_tokens,
                     iterations: result.iterations,
                     cost_usd: result.cost_usd,
+                    silent: false,
                 })),
             )
         }

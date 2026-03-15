@@ -636,17 +636,22 @@ async fn handle_text_message(
                             // (e.g. MiniMax, DeepSeek reasoning tokens)
                             let cleaned_response = strip_think_tags(&result.response);
 
-                            // Guard: ensure we never send an empty response
-                            let content = if cleaned_response.trim().is_empty() {
-                                format!(
-                                    "[The agent completed processing but returned no text response. ({} in / {} out | {} iter)]",
-                                    result.total_usage.input_tokens,
-                                    result.total_usage.output_tokens,
-                                    result.iterations,
+                            // If response is empty after stripping think tags,
+                            // treat as silent — don't leak debug info
+                            if cleaned_response.trim().is_empty() {
+                                let _ = send_json(
+                                    sender,
+                                    &serde_json::json!({
+                                        "type": "silent_complete",
+                                        "input_tokens": result.total_usage.input_tokens,
+                                        "output_tokens": result.total_usage.output_tokens,
+                                    }),
                                 )
-                            } else {
-                                cleaned_response
-                            };
+                                .await;
+                                return;
+                            }
+
+                            let content = cleaned_response;
 
                             // Estimate context pressure from last call
                             let per_call = if result.iterations > 0 {
