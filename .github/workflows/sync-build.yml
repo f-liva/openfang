@@ -5,81 +5,90 @@ on:
     - cron: '0 */6 * * *'  # ogni 6 ore
   workflow_dispatch:        # trigger manuale
   push:
-    branches: [main]        # rebuild ad ogni push su main
+    branches: [custom]      # rebuild ad ogni push su custom
 
 jobs:
   sync-and-build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
+      - name: Checkout fork (custom branch)
         uses: actions/checkout@v4
         with:
+          ref: custom
           fetch-depth: 0
-          token: ${{ github.event_name == 'push' && github.token || secrets.PAT_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Notify Telegram (start)
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d parse_mode="Markdown" \
-            -d text="🚀 *OpenFang Build Started*%0A%0ATrigger: \`${{ github.event_name }}\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            -d text="🚀 *OpenFang Build Started*%0A%0ATrigger: \`${{ github.event_name }}\`%0ABranch: \`custom\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
-      - name: Fetch upstream tags
+      - name: Configure git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+      - name: Sync main with upstream
         if: github.event_name != 'push'
         run: |
           git remote add upstream https://github.com/RightNow-AI/openfang.git || true
           git fetch upstream --tags
+          git fetch origin main
 
-      - name: Check for new release
-        id: check
-        if: github.event_name != 'push'
-        run: |
+          # Fast-forward main to latest upstream tag
           LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
           CURRENT=$(cat .current-upstream-version 2>/dev/null || echo "none")
-          echo "latest=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "LATEST_TAG=$LATEST_TAG" >> "$GITHUB_ENV"
+          echo "CURRENT=$CURRENT" >> "$GITHUB_ENV"
+
           if [ "$LATEST_TAG" != "$CURRENT" ]; then
-            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "NEW_RELEASE=true" >> "$GITHUB_ENV"
+            # Reset main to latest tag, cherry-pick our generic fixes
+            git checkout main
+            git reset --hard "$LATEST_TAG"
+            # Cherry-pick any commits on main that are ours (not upstream)
+            for commit in $(git log origin/main --oneline --format="%H" "$LATEST_TAG"..origin/main 2>/dev/null); do
+              git cherry-pick "$commit" --no-commit && git commit -C "$commit" || git cherry-pick --abort || true
+            done
+            git push origin main --force
+            # Now rebase custom on updated main
+            git checkout custom
+            git rebase main || git rebase --abort
+            echo "$LATEST_TAG" > .current-upstream-version
+            git add .current-upstream-version
+            git commit -m "chore: sync to upstream $LATEST_TAG" || true
+            git push origin custom --force
           else
-            echo "new_release=false" >> "$GITHUB_OUTPUT"
+            echo "NEW_RELEASE=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Rebase on latest tag
-        if: github.event_name != 'push' && steps.check.outputs.new_release == 'true'
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          GIT_SEQUENCE_EDITOR=true git rebase ${{ steps.check.outputs.latest }} || while git rebase --skip 2>/dev/null; do :; done
-          echo "${{ steps.check.outputs.latest }}" > .current-upstream-version
-          git add .current-upstream-version
-          git commit -m "chore: sync to upstream ${{ steps.check.outputs.latest }}" || true
-          git push --force
-
       - name: Set up Docker Buildx
-        if: github.event_name == 'push' || steps.check.outputs.new_release == 'true'
+        if: github.event_name == 'push' || env.NEW_RELEASE == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        if: github.event_name == 'push' || steps.check.outputs.new_release == 'true'
+        if: github.event_name == 'push' || env.NEW_RELEASE == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        if: github.event_name == 'push' || steps.check.outputs.new_release == 'true'
+        if: github.event_name == 'push' || env.NEW_RELEASE == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
             fliva/openfang:latest
-            fliva/openfang:${{ steps.check.outputs.latest || 'custom' }}
+            fliva/openfang:${{ env.LATEST_TAG || 'custom' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Update Docker Hub description
-        if: github.event_name == 'push' || steps.check.outputs.new_release == 'true'
+        if: github.event_name == 'push' || env.NEW_RELEASE == 'true'
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -88,12 +97,12 @@ jobs:
           readme-filepath: ./DOCKER_README.md
 
       - name: Notify Telegram (success)
-        if: success() && (github.event_name == 'push' || steps.check.outputs.new_release == 'true')
+        if: success() && (github.event_name == 'push' || env.NEW_RELEASE == 'true')
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d parse_mode="Markdown" \
-            -d text="✅ *OpenFang Build OK*%0A%0ATag: \`${{ steps.check.outputs.latest || 'custom' }}\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            -d text="✅ *OpenFang Build OK*%0A%0ATag: \`${{ env.LATEST_TAG || 'custom' }}\`%0ABranch: \`custom\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
       - name: Notify Telegram (failure)
         if: failure()
@@ -101,4 +110,4 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d parse_mode="Markdown" \
-            -d text="❌ *OpenFang Build FAILED*%0A%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            -d text="❌ *OpenFang Build FAILED*%0A%0ABranch: \`custom\`%0ACommit: \`${GITHUB_SHA::7}\`%0A[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
