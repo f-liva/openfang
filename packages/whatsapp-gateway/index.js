@@ -128,78 +128,49 @@ async function startConnection() {
       const remoteJid = msg.key.remoteJid || '';
       const isGroup = remoteJid.endsWith('@g.us');
 
-      // Detect media messages
-      const mediaInfo = msg.message?.imageMessage
-        ? { type: 'image', mime: msg.message.imageMessage.mimetype || 'image/jpeg', caption: msg.message.imageMessage.caption || '' }
-        : msg.message?.videoMessage
-        ? { type: 'video', mime: msg.message.videoMessage.mimetype || 'video/mp4', caption: msg.message.videoMessage.caption || '' }
-        : msg.message?.audioMessage
-        ? { type: 'audio', mime: msg.message.audioMessage.mimetype || 'audio/ogg', caption: '' }
-        : msg.message?.documentMessage
-        ? { type: 'document', mime: msg.message.documentMessage.mimetype || 'application/octet-stream', caption: msg.message.documentMessage.caption || '', filename: msg.message.documentMessage.fileName || 'document' }
-        : msg.message?.stickerMessage
-        ? { type: 'sticker', mime: msg.message.stickerMessage.mimetype || 'image/webp', caption: '' }
-        : null;
-
-      const text = msg.message?.conversation
+      let text = msg.message?.conversation
         || msg.message?.extendedTextMessage?.text
         || mediaInfo?.caption
         || '';
 
-      // Skip if no text AND no media
-      if (!text && !mediaInfo) continue;
+      // Detect media type if no text
+      if (!text) {
+        const m = msg.message;
+        if (m?.imageMessage) text = '[Image received]' + (m.imageMessage.caption ? ': ' + m.imageMessage.caption : '');
+        else if (m?.audioMessage) text = '[Voice note received]';
+        else if (m?.videoMessage) text = '[Video received]' + (m.videoMessage.caption ? ': ' + m.videoMessage.caption : '');
+        else if (m?.documentMessage) text = '[Document received: ' + (m.documentMessage.fileName || 'file') + ']';
+        else if (m?.stickerMessage) text = '[Sticker received]';
+        else continue; // Only skip truly empty messages
+      }
 
       // For groups: real sender is in participant; for DMs: it's remoteJid
       const senderJid = isGroup ? (msg.key.participant || '') : remoteJid;
       const phone = '+' + senderJid.replace(/@.*$/, '');
       const pushName = msg.pushName || phone;
 
-      // Build metadata with group context
       const metadata = {
         channel: 'whatsapp',
         sender: phone,
         sender_name: pushName,
       };
-
       if (isGroup) {
         metadata.group_jid = remoteJid;
-        metadata.group_name = msg.key.remoteJid; // basic group ID
         metadata.is_group = true;
-      }
-
-      // Download and upload media if present
-      let attachments = [];
-      if (mediaInfo) {
-        try {
-          const buffer = await downloadMediaMessage(msg, 'buffer', {});
-          const ext = mediaInfo.mime.split('/').pop()?.split(';')[0] || 'bin';
-          const filename = mediaInfo.filename || `${mediaInfo.type}.${ext}`;
-          const agentId = await resolveAgentId(DEFAULT_AGENT_NAME);
-          const fileId = await uploadToOpenFang(agentId, buffer, mediaInfo.mime, filename);
-          attachments.push({ file_id: fileId, filename, content_type: mediaInfo.mime });
-          console.log(`[gateway] Uploaded ${mediaInfo.type} (${(buffer.length / 1024).toFixed(1)}KB) → ${fileId}`);
-        } catch (err) {
-          console.error(`[gateway] Media download/upload failed:`, err.message);
-          // Still forward the text/caption if available
-        }
-      }
-
-      const logText = text ? text.substring(0, 80) : `[${mediaInfo?.type || 'media'}]`;
-      if (isGroup) {
-        console.log(`[gateway] Group msg from ${pushName} (${phone}) in ${remoteJid}: ${logText}`);
+        console.log(`[gateway] Group msg from ${pushName} (${phone}) in ${remoteJid}: ${text.substring(0, 80)}`);
       } else {
-        console.log(`[gateway] Incoming from ${pushName} (${phone}): ${logText}`);
+        console.log(`[gateway] Incoming from ${pushName} (${phone}): ${text.substring(0, 80)}`);
       }
 
       // Forward to OpenFang agent
       const messageText = text || `[${mediaInfo?.type || 'media'} received]`;
       try {
-        const response = await forwardToOpenFang(messageText, phone, pushName, metadata, attachments);
+        const response = await forwardToOpenFang(text, phone, pushName, metadata);
         if (response && response !== '__SILENT__' && sock) {
           // Reply in the same context: group → group, DM → DM
           const replyJid = isGroup ? remoteJid : senderJid.replace(/@.*$/, '') + '@s.whatsapp.net';
           await sock.sendMessage(replyJid, { text: response });
-          console.log(`[gateway] Replied to ${pushName}${isGroup ? ' in group ' + remoteJid : ' privately'}`);
+          console.log(`[gateway] Replied to ${pushName}${isGroup ? ' in group ' + remoteJid : ''}`);
         }
       } catch (err) {
         console.error(`[gateway] Forward/reply failed:`, err.message);
@@ -293,9 +264,7 @@ async function uploadToOpenFang(agentId, buffer, contentType, filename) {
 // ---------------------------------------------------------------------------
 // Forward incoming message to OpenFang API, return agent response
 // ---------------------------------------------------------------------------
-async function forwardToOpenFang(text, phone, pushName, metadata, attachments) {
-  const agentId = await resolveAgentId(DEFAULT_AGENT_NAME);
-
+function forwardToOpenFang(text, phone, pushName, metadata) {
   return new Promise((resolve, reject) => {
     const body = {
       message: text,
@@ -363,12 +332,7 @@ async function sendMessage(to, text) {
   }
 
   // If already a full JID (group or user), use as-is; otherwise normalize phone → JID
-  let jid;
-  if (to.includes('@')) {
-    jid = to;
-  } else {
-    jid = to.replace(/^\+/, '') + '@s.whatsapp.net';
-  }
+  const jid = to.includes('@') ? to : to.replace(/^\+/, '') + '@s.whatsapp.net';
 
   await sock.sendMessage(jid, { text });
 }

@@ -18,7 +18,7 @@ use openfang_types::model_catalog::{
     AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
     DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
     KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL,
-    MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
+    MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
     OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
@@ -220,6 +220,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         "venice" => Some(ProviderDefaults {
             base_url: VENICE_BASE_URL,
             api_key_env: "VENICE_API_KEY",
+            key_required: true,
+        }),
+        "nvidia" | "nvidia-nim" => Some(ProviderDefaults {
+            base_url: NVIDIA_NIM_BASE_URL,
+            api_key_env: "NVIDIA_API_KEY",
             key_required: true,
         }),
         _ => None,
@@ -436,7 +441,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             chutes, venice, codex, claude-code, qwen-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             chutes, venice, nvidia, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -509,6 +514,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "volcengine",
         "chutes",
         "venice",
+        "nvidia",
         "codex",
         "claude-code",
         "qwen-code",
@@ -613,10 +619,11 @@ mod tests {
         assert!(providers.contains(&"qianfan"));
         assert!(providers.contains(&"volcengine"));
         assert!(providers.contains(&"chutes"));
+        assert!(providers.contains(&"nvidia"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
         assert!(providers.contains(&"qwen-code"));
-        assert_eq!(providers.len(), 35);
+        assert_eq!(providers.len(), 36);
     }
 
     #[test]
@@ -658,26 +665,25 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_provider_convention_env_var() {
-        // Set NVIDIA_API_KEY env var, then create a custom "nvidia" provider with base_url.
-        // The driver should pick up the key automatically via convention.
+    fn test_nvidia_provider_with_env_key() {
+        // NVIDIA NIM is a known provider — set API key and verify driver creation succeeds.
         let unique_key = "test-nvidia-key-12345";
         std::env::set_var("NVIDIA_API_KEY", unique_key);
         let config = DriverConfig {
             provider: "nvidia".to_string(),
-            api_key: None, // not explicitly passed
-            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            api_key: None, // picked up from env via provider_defaults
+            base_url: None,
             skip_permissions: true,
             profiles: vec![],
         };
         let driver = create_driver(&config);
-        assert!(driver.is_ok(), "Custom provider with env var convention should succeed");
+        assert!(driver.is_ok(), "NVIDIA provider with env var should succeed");
         std::env::remove_var("NVIDIA_API_KEY");
     }
 
     #[test]
-    fn test_custom_provider_no_key_no_url_errors() {
-        // Custom provider with neither API key nor base_url should error.
+    fn test_nvidia_provider_no_key_errors() {
+        // NVIDIA NIM provider with no API key should error.
         let config = DriverConfig {
             provider: "nvidia".to_string(),
             api_key: None,
@@ -692,10 +698,10 @@ mod tests {
     #[test]
     fn test_custom_provider_key_no_url_helpful_error() {
         // Custom provider with key set (via env) but no base_url should give helpful error.
-        let unique_key = "test-nvidia-key-67890";
-        std::env::set_var("NVIDIA_API_KEY", unique_key);
+        let unique_key = "test-custom-key-67890";
+        std::env::set_var("MYCUSTOM_API_KEY", unique_key);
         let config = DriverConfig {
-            provider: "nvidia".to_string(),
+            provider: "mycustom".to_string(),
             api_key: None,
             base_url: None,
             skip_permissions: true,
@@ -705,7 +711,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("base_url"), "Error should mention base_url: {}", err);
-        std::env::remove_var("NVIDIA_API_KEY");
+        std::env::remove_var("MYCUSTOM_API_KEY");
     }
 
     #[test]

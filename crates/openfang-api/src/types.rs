@@ -42,15 +42,12 @@ pub struct MessageRequest {
     /// Optional file attachments (uploaded via /upload endpoint).
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
-    /// Optional channel metadata (sender identity, channel type).
-    ///
-    /// Used by external gateways (e.g. WhatsApp) to forward sender information
-    /// so the agent knows who is writing. Expected keys:
-    /// - `channel`: channel name (e.g. "whatsapp", "telegram")
-    /// - `sender`: platform-specific sender ID (e.g. phone number)
-    /// - `sender_name`: human-readable sender name
+    /// Sender identity (e.g. WhatsApp phone number, Telegram user ID).
     #[serde(default)]
-    pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub sender_id: Option<String>,
+    /// Sender display name.
+    #[serde(default)]
+    pub sender_name: Option<String>,
 }
 
 /// Response from sending a message.
