@@ -164,7 +164,7 @@ async function startConnection() {
       // Forward to OpenFang agent
       try {
         const response = await forwardToOpenFang(text, phone, pushName, metadata);
-        if (response && sock) {
+        if (response && response !== '__SILENT__' && sock) {
           // Reply in the same context: group → group, DM → DM
           const replyJid = isGroup ? remoteJid : senderJid.replace(/@.*$/, '') + '@s.whatsapp.net';
           await sock.sendMessage(replyJid, { text: response });
@@ -211,6 +211,11 @@ function forwardToOpenFang(text, phone, pushName, metadata) {
         res.on('end', () => {
           try {
             const data = JSON.parse(body);
+            // If the agent intentionally chose silence, signal the caller
+            if (data.silent) {
+              resolve('__SILENT__');
+              return;
+            }
             // The /api/agents/{id}/message endpoint returns { response: "..." }
             resolve(data.response || data.message || data.text || '');
           } catch {
@@ -242,6 +247,45 @@ async function sendMessage(to, text) {
   const jid = to.includes('@') ? to : to.replace(/^\+/, '') + '@s.whatsapp.net';
 
   await sock.sendMessage(jid, { text });
+}
+
+// ---------------------------------------------------------------------------
+// Send media (audio/image/file) via Baileys
+// ---------------------------------------------------------------------------
+async function sendMedia(to, filePath, mimetype, options = {}) {
+  if (!sock || connStatus !== 'connected') {
+    throw new Error('WhatsApp not connected');
+  }
+
+  let jid;
+  if (to.includes('@')) {
+    jid = to;
+  } else {
+    jid = to.replace(/^\+/, '') + '@s.whatsapp.net';
+  }
+
+  const buffer = fs.readFileSync(filePath);
+
+  // Determine message type from mimetype
+  if (mimetype.startsWith('audio/')) {
+    await sock.sendMessage(jid, {
+      audio: buffer,
+      mimetype: mimetype,
+      ptt: options.ptt !== false, // voice note by default
+    });
+  } else if (mimetype.startsWith('image/')) {
+    await sock.sendMessage(jid, {
+      image: buffer,
+      mimetype: mimetype,
+      caption: options.caption || '',
+    });
+  } else {
+    await sock.sendMessage(jid, {
+      document: buffer,
+      mimetype: mimetype,
+      fileName: options.filename || path.basename(filePath),
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +381,20 @@ const server = http.createServer(async (req, res) => {
 
       await sendMessage(to, text);
       return jsonResponse(res, 200, { success: true, message: 'Sent' });
+    }
+
+    // POST /message/send-media — send audio/image/file via Baileys
+    if (req.method === 'POST' && pathname === '/message/send-media') {
+      const body = await parseBody(req);
+      const { to, file_path: fp, mimetype, ptt, caption, filename } = body;
+
+      if (!to || !fp) {
+        return jsonResponse(res, 400, { error: 'Missing "to" or "file_path" field' });
+      }
+
+      const mime = mimetype || 'application/octet-stream';
+      await sendMedia(to, fp, mime, { ptt, caption, filename });
+      return jsonResponse(res, 200, { success: true, message: 'Media sent' });
     }
 
     // GET /health — health check
