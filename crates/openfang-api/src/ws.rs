@@ -702,14 +702,22 @@ async fn handle_text_message(
                             // Strip <think>...</think> blocks
                             let cleaned = strip_think_tags(&accumulated_text);
 
-                            let content = if cleaned.trim().is_empty() {
-                                format!(
-                                    "[The agent completed processing but returned no text response. ({} in / {} out)]",
-                                    usage.input_tokens, usage.output_tokens,
+                            // If response is empty after stripping think tags,
+                            // treat as silent — don't leak debug info
+                            if cleaned.trim().is_empty() {
+                                let _ = send_json(
+                                    sender,
+                                    &serde_json::json!({
+                                        "type": "silent_complete",
+                                        "input_tokens": usage.input_tokens,
+                                        "output_tokens": usage.output_tokens,
+                                    }),
                                 )
-                            } else {
-                                cleaned
-                            };
+                                .await;
+                                return;
+                            }
+
+                            let content = cleaned;
 
                             // Estimate context pressure
                             let ctx_pct = (usage.input_tokens as f64 / 200_000.0 * 100.0).min(100.0);

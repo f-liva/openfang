@@ -59,6 +59,8 @@ pub struct MessageResponse {
     pub iterations: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub silent: bool,
 }
 
 /// Request to install a skill from the marketplace.
