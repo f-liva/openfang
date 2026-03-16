@@ -155,7 +155,23 @@ async function startConnection() {
         console.log(`[gateway] Reconnecting in ${delay}ms (attempt ${reconnectAttempt})...`);
         statusMessage = `Reconnecting (attempt ${reconnectAttempt})...`;
         connStatus = 'disconnected';
-        setTimeout(() => startConnection(), delay);
+        setTimeout(async () => {
+          try {
+            await startConnection();
+          } catch (err) {
+            console.error(`[gateway] Reconnect attempt ${reconnectAttempt} failed:`, err.message);
+            // Schedule another retry with increased backoff
+            reconnectAttempt++;
+            const nextDelay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
+            console.log(`[gateway] Will retry in ${nextDelay}ms (attempt ${reconnectAttempt})...`);
+            statusMessage = `Reconnect failed, retrying (attempt ${reconnectAttempt})...`;
+            setTimeout(async () => {
+              try { await startConnection(); } catch (e) {
+                console.error(`[gateway] Reconnect attempt ${reconnectAttempt} also failed:`, e.message);
+              }
+            }, nextDelay);
+          }
+        }, delay);
       }
     }
 
@@ -603,6 +619,59 @@ server.listen(PORT, '127.0.0.1', async () => {
   } else {
     console.log('[gateway] No credentials found. Waiting for POST /login/start to begin QR flow...');
   }
+});
+
+// ---------------------------------------------------------------------------
+// Health check — detect zombie connections (socket exists but not functional)
+// ---------------------------------------------------------------------------
+const HEALTH_CHECK_INTERVAL = 30_000; // 30 seconds
+let lastMessageTime = Date.now();
+
+// Track last successful activity
+const originalOnMessage = null;
+
+setInterval(() => {
+  if (connStatus !== 'connected' || !sock) return;
+
+  // Check if the socket's underlying WebSocket is still alive
+  try {
+    const wsState = sock?.ws?.readyState;
+    // WebSocket states: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+    if (wsState !== undefined && wsState !== 1) {
+      console.warn(`[gateway] Health check: WebSocket in bad state (${wsState}), triggering reconnect`);
+      connStatus = 'disconnected';
+      statusMessage = 'Health check detected stale connection, reconnecting...';
+      reconnectAttempt = 0;
+      try { sock.end(); } catch {}
+      sock = null;
+      startConnection().catch((err) => {
+        console.error('[gateway] Health-check reconnect failed:', err.message);
+      });
+    }
+  } catch (err) {
+    console.warn(`[gateway] Health check error:`, err.message);
+  }
+}, HEALTH_CHECK_INTERVAL);
+
+// ---------------------------------------------------------------------------
+// Uncaught exception / rejection handlers — prevent silent death
+// ---------------------------------------------------------------------------
+process.on('uncaughtException', (err) => {
+  console.error('[gateway] UNCAUGHT EXCEPTION:', err.message, err.stack);
+  // Don't exit — PM2 will restart, but let's try to self-heal first
+  if (connStatus === 'connected') {
+    connStatus = 'disconnected';
+    statusMessage = 'Recovering from uncaught exception...';
+    setTimeout(async () => {
+      try { await startConnection(); } catch (e) {
+        console.error('[gateway] Recovery after uncaught exception failed:', e.message);
+      }
+    }, 5000);
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[gateway] UNHANDLED REJECTION:', reason);
 });
 
 // Graceful shutdown
