@@ -109,6 +109,10 @@ let qrTimer = null;             // QR code expiration timer
 let pingInterval = null;        // WebSocket keepalive ping interval
 let processingMessage = false;  // message queue lock
 const messageQueue = [];        // serialized message processing queue
+let lastDisconnectedAt = 0;     // timestamp of last disconnection — used to recover missed messages
+const processedMessageIds = new Set(); // dedup: track recently processed message IDs
+const MAX_PROCESSED_IDS = 500;  // cap dedup set size
+const RECOVERY_WINDOW_MS = 120_000; // recover messages from the last 2 minutes after reconnect
 
 // Tuning constants
 const QR_TIMEOUT_MS = 60_000;     // QR expires after 60s — auto-regenerate
@@ -191,6 +195,8 @@ async function startConnection() {
       // Clear ping interval on disconnect
       if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
       if (qrTimer) { clearTimeout(qrTimer); qrTimer = null; }
+
+      lastDisconnectedAt = Date.now();
 
       if (statusCode === DisconnectReason.loggedOut) {
         // User logged out from phone — clear auth and stop (truly non-recoverable)
@@ -282,14 +288,47 @@ async function startConnection() {
   }
 
   // Incoming messages → enqueue for serialized processing
+  // Also recovers messages missed during connection gaps (type=append)
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log(`[gateway] messages.upsert: type=${type}, count=${messages.length}`);
-    if (type !== 'notify') return;
+
+    const isNotify = type === 'notify';
+    const isAppend = type === 'append';
+
+    // Only process notify (live) and append (history sync for recovery)
+    if (!isNotify && !isAppend) return;
 
     for (const msg of messages) {
       // Skip messages from self and status broadcasts
       if (msg.key.fromMe) continue;
       if (msg.key.remoteJid === 'status@broadcast') continue;
+
+      // Dedup: skip if we've already processed this message
+      const msgId = msg.key.id;
+      if (processedMessageIds.has(msgId)) {
+        continue;
+      }
+
+      if (isAppend) {
+        // History sync — only process recent messages missed during disconnection
+        const msgTimestamp = (msg.messageTimestamp || 0) * 1000; // Baileys uses seconds
+        const now = Date.now();
+        const cutoff = Math.max(lastDisconnectedAt - 5000, now - RECOVERY_WINDOW_MS);
+
+        if (msgTimestamp < cutoff) {
+          continue; // too old, skip
+        }
+
+        console.log(`[gateway] RECOVERY: processing missed message id=${msgId} from=${msg.pushName || 'unknown'} age=${Math.round((now - msgTimestamp) / 1000)}s`);
+      }
+
+      // Track as processed
+      processedMessageIds.add(msgId);
+      // Cap dedup set size
+      if (processedMessageIds.size > MAX_PROCESSED_IDS) {
+        const iter = processedMessageIds.values();
+        processedMessageIds.delete(iter.next().value);
+      }
 
       // [FIX #7] Enqueue message for serialized processing
       messageQueue.push(msg);
