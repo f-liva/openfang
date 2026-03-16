@@ -194,12 +194,37 @@ async function startConnection() {
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
         const sender = msg.key.remoteJid || '';
-        const text =
+        let text =
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
           msg.message?.imageMessage?.caption ||
           msg.message?.videoMessage?.caption ||
           '';
+
+        // vCard / contact message support
+        if (!text && msg.message?.contactMessage) {
+          const vc = msg.message.contactMessage;
+          const vcardStr = vc.vcard || '';
+          // Extract name from displayName or vCard FN field
+          const contactName = vc.displayName || (vcardStr.match(/FN:(.*)/)?.[1]?.trim()) || 'Sconosciuto';
+          // Extract phone numbers from TEL fields
+          const phones = [...vcardStr.matchAll(/TEL[^:]*:([\d\s+\-().]+)/g)].map(m => m[1].trim());
+          text = `[Contatto condiviso] ${contactName}` + (phones.length ? ` — ${phones.join(', ')}` : '');
+          log('info', `vCard received from ${sender}: ${contactName}, phones: ${phones.join(', ')}`);
+        }
+
+        // Multi-contact message (contactsArrayMessage)
+        if (!text && msg.message?.contactsArrayMessage) {
+          const contacts = msg.message.contactsArrayMessage.contacts || [];
+          const entries = contacts.map(c => {
+            const vcardStr = c.vcard || '';
+            const name = c.displayName || (vcardStr.match(/FN:(.*)/)?.[1]?.trim()) || '?';
+            const phones = [...vcardStr.matchAll(/TEL[^:]*:([\d\s+\-().]+)/g)].map(m => m[1].trim());
+            return `${name}${phones.length ? ` (${phones.join(', ')})` : ''}`;
+          });
+          text = `[Contatti condivisi] ${entries.join('; ')}`;
+          log('info', `Multi-vCard received from ${sender}: ${entries.length} contacts`);
+        }
 
         if (!text) {
           log('info', `No text content in message from ${sender} (stub=${msg.messageStubType || 'none'})`);
