@@ -101,12 +101,14 @@ let connStatus = 'disconnected'; // disconnected | qr_ready | connected
 let qrExpired = false;
 let statusMessage = 'Not started';
 let reconnectAttempt = 0; // exponential backoff counter
-const MAX_RECONNECT_DELAY = 60_000; // cap at 60s
+const MAX_RECONNECT_DELAY = 30_000; // cap at 30s (was 60s — too slow)
 let lastPongTime = Date.now();  // track last successful WebSocket pong
 let lastConnectedAt = 0;        // timestamp of last successful connection
 const STABLE_CONNECTION_MS = 10_000; // connection must last 10s to be considered stable
 let qrTimer = null;             // QR code expiration timer
 let pingInterval = null;        // WebSocket keepalive ping interval
+let watchdogInterval = null;    // [RESILIENCE] connection watchdog timer
+let reconnectTimerId = null;    // [RESILIENCE] guard against duplicate reconnect timers
 let processingMessage = false;  // message queue lock
 const messageQueue = [];        // serialized message processing queue
 let lastDisconnectedAt = 0;     // timestamp of last disconnection — used to recover missed messages
@@ -114,12 +116,113 @@ const processedMessageIds = new Set(); // dedup: track recently processed messag
 const MAX_PROCESSED_IDS = 500;  // cap dedup set size
 const RECOVERY_WINDOW_MS = 120_000; // recover messages from the last 2 minutes after reconnect
 
+// Persistent dedup file — survives process restarts
+const DEDUP_FILE = path.join(__dirname, '.processed_ids.json');
+
 // Tuning constants
 const QR_TIMEOUT_MS = 60_000;     // QR expires after 60s — auto-regenerate
 const PING_INTERVAL_MS = 25_000;  // WebSocket keepalive ping every 25s
-const PING_STALE_MS = 90_000;     // consider connection dead if no pong in 90s
+const PING_STALE_MS = 45_000;     // consider connection dead if no pong in 45s (was 90s)
+const WATCHDOG_INTERVAL_MS = 30_000; // [RESILIENCE] check "am I connected?" every 30s
+const WATCHDOG_MAX_DISCONNECTED_MS = 120_000; // [RESILIENCE] force process exit if disconnected > 2min
 const MAX_MEDIA_RETRIES = 3;      // retry count for media download/upload
 const MAX_API_RETRIES = 3;        // retry count for OpenFang API calls
+
+// ---------------------------------------------------------------------------
+// [RESILIENCE] Persistent dedup — load/save processed message IDs to disk
+// ---------------------------------------------------------------------------
+function loadDedupIds() {
+  try {
+    const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf-8'));
+    if (Array.isArray(data)) {
+      for (const id of data.slice(-MAX_PROCESSED_IDS)) {
+        processedMessageIds.add(id);
+      }
+      console.log(`[gateway] Loaded ${processedMessageIds.size} dedup IDs from disk`);
+    }
+  } catch { /* no file or corrupt — start fresh */ }
+}
+
+function saveDedupIds() {
+  try {
+    fs.writeFileSync(DEDUP_FILE, JSON.stringify([...processedMessageIds]), 'utf-8');
+  } catch (err) {
+    console.warn(`[gateway] Failed to save dedup IDs:`, err.message);
+  }
+}
+
+// Load dedup IDs on startup
+loadDedupIds();
+
+// Save dedup IDs periodically (every 30s) and on exit
+setInterval(saveDedupIds, 30_000);
+
+// ---------------------------------------------------------------------------
+// [RESILIENCE] Safe reconnect scheduler — prevents duplicate timers
+// ---------------------------------------------------------------------------
+function scheduleReconnect(delayMs, label) {
+  if (reconnectTimerId) {
+    console.log(`[gateway] Reconnect already scheduled, skipping duplicate (${label})`);
+    return;
+  }
+  console.log(`[gateway] Scheduling reconnect in ${delayMs}ms (${label})`);
+  reconnectTimerId = setTimeout(async () => {
+    reconnectTimerId = null;
+    try {
+      await startConnection();
+    } catch (err) {
+      console.error(`[gateway] Reconnect failed (${label}):`, err.message);
+      // Don't leave the process stuck — schedule another attempt
+      reconnectAttempt++;
+      const nextDelay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
+      scheduleReconnect(nextDelay, 'retry after failure');
+    }
+  }, delayMs);
+}
+
+// ---------------------------------------------------------------------------
+// [RESILIENCE] Connection watchdog — catches ALL cases where we're stuck disconnected
+// ---------------------------------------------------------------------------
+let disconnectedSince = 0; // track when we first became disconnected
+
+function startWatchdog() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+
+  watchdogInterval = setInterval(() => {
+    const now = Date.now();
+
+    if (connStatus === 'connected') {
+      disconnectedSince = 0; // reset
+      return;
+    }
+
+    // We're not connected — track how long
+    if (disconnectedSince === 0) {
+      disconnectedSince = now;
+    }
+
+    const disconnectedMs = now - disconnectedSince;
+
+    // If no reconnect is pending, schedule one
+    if (!reconnectTimerId) {
+      console.warn(`[gateway] WATCHDOG: Not connected, no reconnect pending — forcing reconnect`);
+      reconnectAttempt = 0;
+      scheduleReconnect(1000, 'watchdog forced');
+      return;
+    }
+
+    // If disconnected for too long, let PM2 handle it with a clean restart
+    if (disconnectedMs > WATCHDOG_MAX_DISCONNECTED_MS) {
+      console.error(`[gateway] WATCHDOG: Disconnected for ${Math.round(disconnectedMs / 1000)}s — forcing process exit for PM2 restart`);
+      saveDedupIds();
+      cleanupPidFile();
+      process.exit(1);
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+
+// Start watchdog immediately
+startWatchdog();
 
 // ---------------------------------------------------------------------------
 // Baileys connection
@@ -176,10 +279,7 @@ async function startConnection() {
             console.warn('[gateway] QR code expired after 60s — regenerating');
             try { if (sock) sock.end(); } catch {}
             sock = null;
-            startConnection().catch((err) => {
-              console.error('[gateway] QR regeneration failed:', err.message);
-              statusMessage = 'QR regeneration failed. Use POST /login/start to retry.';
-            });
+            scheduleReconnect(1000, 'QR expired');
           }
         }, QR_TIMEOUT_MS);
       } catch (err) {
@@ -222,38 +322,25 @@ async function startConnection() {
 
         // Detect conflict loops (rapid connect → conflict → reconnect)
         const isConflict = reason.includes('conflict') || statusCode === 440;
+        connStatus = 'disconnected';
+        // Ensure old socket is fully dead before reconnecting
+        try { if (sock) sock.end(); } catch {}
+        sock = null;
+
         if (isConflict) {
           // Conflict means another session is active. Use longer base delay
-          // to let the old session fully deregister before reconnecting
           reconnectAttempt++;
           const delay = Math.min(5000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
           console.warn(`[gateway] Conflict detected — waiting ${delay}ms before reconnect (attempt ${reconnectAttempt})`);
           statusMessage = `Session conflict — reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempt})...`;
-          connStatus = 'disconnected';
-          // Ensure old socket is fully dead before reconnecting
-          try { if (sock) sock.end(); } catch {}
-          sock = null;
-          setTimeout(async () => {
-            try {
-              await startConnection();
-            } catch (err) {
-              console.error(`[gateway] Reconnect after conflict failed:`, err.message);
-            }
-          }, delay);
+          scheduleReconnect(delay, 'conflict');
         } else {
           // Normal disconnect — reconnect with standard backoff
           reconnectAttempt++;
           const delay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
           console.log(`[gateway] Reconnecting in ${delay}ms (attempt ${reconnectAttempt})...`);
           statusMessage = `Reconnecting (attempt ${reconnectAttempt})...`;
-          connStatus = 'disconnected';
-          setTimeout(async () => {
-            try {
-              await startConnection();
-            } catch (err) {
-              console.error(`[gateway] Reconnect attempt ${reconnectAttempt} failed:`, err.message);
-            }
-          }, delay);
+          scheduleReconnect(delay, 'disconnect');
         }
       }
     }
@@ -264,10 +351,13 @@ async function startConnection() {
       qrDataUrl = '';
       lastPongTime = Date.now();
       lastConnectedAt = Date.now();
+      disconnectedSince = 0; // reset watchdog tracker
+      reconnectAttempt = 0; // reset backoff on successful connection
       statusMessage = 'Connected to WhatsApp';
       console.log('[gateway] Connected to WhatsApp!');
-      // Only reset backoff if the connection was stable (lasted > 10s)
-      // This prevents conflict loops from resetting the backoff counter
+
+      // Clear any pending reconnect timer (we're already connected)
+      if (reconnectTimerId) { clearTimeout(reconnectTimerId); reconnectTimerId = null; }
 
       // Clear QR timer — no longer needed
       if (qrTimer) { clearTimeout(qrTimer); qrTimer = null; }
@@ -322,13 +412,15 @@ async function startConnection() {
         console.log(`[gateway] RECOVERY: processing missed message id=${msgId} from=${msg.pushName || 'unknown'} age=${Math.round((now - msgTimestamp) / 1000)}s`);
       }
 
-      // Track as processed
+      // Track as processed (persisted to disk periodically)
       processedMessageIds.add(msgId);
       // Cap dedup set size
       if (processedMessageIds.size > MAX_PROCESSED_IDS) {
         const iter = processedMessageIds.values();
         processedMessageIds.delete(iter.next().value);
       }
+      // Save dedup state after each batch
+      saveDedupIds();
 
       // [FIX #7] Enqueue message for serialized processing
       messageQueue.push(msg);
@@ -530,9 +622,7 @@ function triggerReconnect(reason) {
   if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
   try { if (sock) sock.end(); } catch {}
   sock = null;
-  startConnection().catch((err) => {
-    console.error(`[gateway] Reconnect after ${reason} failed:`, err.message);
-  });
+  scheduleReconnect(1000, reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +952,10 @@ const server = http.createServer(async (req, res) => {
         processing: processingMessage,
         last_pong_ms_ago: timeSinceLastPong,
         reconnect_attempts: reconnectAttempt,
+        reconnect_pending: reconnectTimerId !== null,
+        disconnected_seconds: disconnectedSince > 0 ? Math.round((now - disconnectedSince) / 1000) : 0,
+        watchdog_active: watchdogInterval !== null,
+        dedup_ids_count: processedMessageIds.size,
       });
     }
 
@@ -1021,39 +1115,40 @@ await startServer();
 // ---------------------------------------------------------------------------
 process.on('uncaughtException', (err) => {
   console.error('[gateway] UNCAUGHT EXCEPTION:', err.message, err.stack);
-  // Don't exit — PM2 will restart, but let's try to self-heal first
-  if (connStatus === 'connected') {
-    connStatus = 'disconnected';
-    statusMessage = 'Recovering from uncaught exception...';
-    setTimeout(async () => {
-      try { await startConnection(); } catch (e) {
-        console.error('[gateway] Recovery after uncaught exception failed:', e.message);
-      }
-    }, 5000);
-  }
+  // Always try to recover, regardless of current connection state
+  connStatus = 'disconnected';
+  statusMessage = 'Recovering from uncaught exception...';
+  try { if (sock) sock.end(); } catch {}
+  sock = null;
+  if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+  scheduleReconnect(5000, 'uncaught exception');
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('[gateway] UNHANDLED REJECTION:', reason);
+  // If we're disconnected and no reconnect is pending, schedule one
+  if (connStatus !== 'connected' && !reconnectTimerId) {
+    scheduleReconnect(3000, 'unhandled rejection');
+  }
 });
 
 // Graceful shutdown — clean up PID file and intervals
-process.on('SIGINT', () => {
-  console.log('\n[gateway] Shutting down...');
+function gracefulShutdown(signal) {
+  console.log(`\n[gateway] Shutting down (${signal})...`);
+  saveDedupIds();
   cleanupPidFile();
   if (pingInterval) clearInterval(pingInterval);
+  if (watchdogInterval) clearInterval(watchdogInterval);
   if (qrTimer) clearTimeout(qrTimer);
+  if (reconnectTimerId) clearTimeout(reconnectTimerId);
   if (sock) sock.end();
   server.close(() => process.exit(0));
-});
+  // Force exit after 5s if server.close hangs
+  setTimeout(() => process.exit(0), 5000);
+}
 
-process.on('SIGTERM', () => {
-  cleanupPidFile();
-  if (pingInterval) clearInterval(pingInterval);
-  if (qrTimer) clearTimeout(qrTimer);
-  if (sock) sock.end();
-  server.close(() => process.exit(0));
-});
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('exit', () => {
   cleanupPidFile();
