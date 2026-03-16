@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
+import net from 'node:net';
 import { randomUUID } from 'node:crypto';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -202,6 +204,13 @@ async function startConnection() {
       // Skip messages from self and status broadcasts
       if (msg.key.fromMe) continue;
       if (msg.key.remoteJid === 'status@broadcast') continue;
+
+      // Send read receipt (blue checkmarks) immediately
+      try {
+        await sock.readMessages([msg.key]);
+      } catch (err) {
+        console.warn(`[gateway] Failed to send read receipt:`, err.message);
+      }
 
       const remoteJid = msg.key.remoteJid || '';
       const isGroup = remoteJid.endsWith('@g.us');
@@ -601,7 +610,130 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', async () => {
+// ---------------------------------------------------------------------------
+// PID file management
+// ---------------------------------------------------------------------------
+const PID_FILE = path.join(__dirname, 'gateway.pid');
+
+function writePidFile() {
+  fs.writeFileSync(PID_FILE, String(process.pid), 'utf-8');
+  console.log(`[gateway] PID file written: ${PID_FILE} (${process.pid})`);
+}
+
+function cleanupPidFile() {
+  try { fs.unlinkSync(PID_FILE); } catch {}
+}
+
+function killStalePidFile() {
+  try {
+    const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf-8').trim(), 10);
+    if (oldPid && oldPid !== process.pid) {
+      try {
+        process.kill(oldPid, 0); // check if alive
+        console.warn(`[gateway] Stale PID file found (PID ${oldPid}), killing...`);
+        process.kill(oldPid, 'SIGTERM');
+        // Wait briefly, then force-kill if still alive
+        const start = Date.now();
+        while (Date.now() - start < 2000) {
+          try { process.kill(oldPid, 0); } catch { break; } // dead
+          execSync('sleep 0.2');
+        }
+        try { process.kill(oldPid, 'SIGKILL'); } catch {}
+      } catch {
+        // Process already dead — clean up stale PID file
+      }
+    }
+  } catch {
+    // No PID file or unreadable — fine
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Port cleanup — robust cleanup with PID file + port scan + retry
+// ---------------------------------------------------------------------------
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const testSock = net.createConnection({ port, host: '127.0.0.1' }, () => {
+      testSock.destroy();
+      resolve(false); // occupied
+    });
+    testSock.on('error', () => resolve(true)); // free
+  });
+}
+
+function killProcessOnPort(port) {
+  try {
+    const out = execSync(`ss -tlnp sport = :${port} 2>/dev/null || true`, { encoding: 'utf-8' });
+    const pidMatch = out.match(/pid=(\d+)/);
+    if (pidMatch) {
+      const pid = parseInt(pidMatch[1], 10);
+      if (pid !== process.pid) {
+        console.warn(`[gateway] Killing process PID ${pid} on port ${port}`);
+        try { process.kill(pid, 'SIGTERM'); } catch {}
+        return pid;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function ensurePortFree(port, maxRetries = 3) {
+  // Step 1: Kill stale process from PID file
+  killStalePidFile();
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (await isPortFree(port)) {
+      return; // port is free
+    }
+
+    console.warn(`[gateway] Port ${port} occupied (attempt ${attempt}/${maxRetries})`);
+
+    // Try to kill whatever is holding the port
+    const pid = killProcessOnPort(port);
+
+    if (pid) {
+      // Wait for process to die
+      await new Promise((r) => setTimeout(r, 1500));
+      // Force-kill if still alive
+      try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch {}
+      await new Promise((r) => setTimeout(r, 500));
+    } else {
+      // ss couldn't find it — wait and retry
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  // Final check
+  if (!(await isPortFree(port))) {
+    console.error(`[gateway] FATAL: Port ${port} still occupied after ${maxRetries} cleanup attempts`);
+    process.exit(1);
+  }
+}
+
+await ensurePortFree(PORT);
+writePidFile();
+
+// Listen with EADDRINUSE retry as last-resort safety net
+function startServer() {
+  return new Promise((resolve, reject) => {
+    server.once('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`[gateway] EADDRINUSE on listen — retrying cleanup...`);
+        ensurePortFree(PORT, 2).then(() => {
+          server.listen(PORT, '127.0.0.1', resolve);
+        }).catch(reject);
+      } else {
+        reject(err);
+      }
+    });
+    server.listen(PORT, '127.0.0.1', resolve);
+  });
+}
+
+await startServer();
+
+// Post-listen setup
+(async () => {
   // Resolve agent name to UUID before anything else
   DEFAULT_AGENT = await resolveAgentId(DEFAULT_AGENT);
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
@@ -619,7 +751,7 @@ server.listen(PORT, '127.0.0.1', async () => {
   } else {
     console.log('[gateway] No credentials found. Waiting for POST /login/start to begin QR flow...');
   }
-});
+})();
 
 // ---------------------------------------------------------------------------
 // Health check — detect zombie connections (socket exists but not functional)
@@ -674,14 +806,20 @@ process.on('unhandledRejection', (reason) => {
   console.error('[gateway] UNHANDLED REJECTION:', reason);
 });
 
-// Graceful shutdown
+// Graceful shutdown — clean up PID file
 process.on('SIGINT', () => {
   console.log('\n[gateway] Shutting down...');
+  cleanupPidFile();
   if (sock) sock.end();
   server.close(() => process.exit(0));
 });
 
 process.on('SIGTERM', () => {
+  cleanupPidFile();
   if (sock) sock.end();
   server.close(() => process.exit(0));
+});
+
+process.on('exit', () => {
+  cleanupPidFile();
 });
