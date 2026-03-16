@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
 
@@ -17,7 +17,61 @@ const __dirname = path.dirname(__filename);
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
 const OPENFANG_URL = (process.env.OPENFANG_URL || 'http://127.0.0.1:4200').replace(/\/+$/, '');
-const DEFAULT_AGENT = process.env.OPENFANG_DEFAULT_AGENT || 'assistant';
+
+// Resolve default agent: env var > config.toml [channels.whatsapp].default_agent > 'assistant'
+function readDefaultAgentFromConfig() {
+  const configPaths = ['/data/config.toml', path.join(__dirname, '..', 'config.toml')];
+  for (const cfgPath of configPaths) {
+    try {
+      const content = fs.readFileSync(cfgPath, 'utf-8');
+      // Find [channels.whatsapp] section and extract default_agent
+      const waSection = content.match(/\[channels\.whatsapp\]([^[]*)/s);
+      if (waSection) {
+        const agentMatch = waSection[1].match(/default_agent\s*=\s*"([^"]+)"/);
+        if (agentMatch) {
+          console.log(`[gateway] Read default_agent="${agentMatch[1]}" from ${cfgPath}`);
+          return agentMatch[1];
+        }
+      }
+    } catch { /* file not found, try next */ }
+  }
+  return null;
+}
+
+let DEFAULT_AGENT = process.env.OPENFANG_DEFAULT_AGENT
+  || readDefaultAgentFromConfig()
+  || 'assistant';
+
+// ---------------------------------------------------------------------------
+// Resolve agent name → UUID if needed (OpenFang API requires UUID)
+// ---------------------------------------------------------------------------
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function resolveAgentId(nameOrId) {
+  if (UUID_RE.test(nameOrId)) return nameOrId;
+  return new Promise((resolve) => {
+    const url = new URL(`${OPENFANG_URL}/api/agents`);
+    http.get({ hostname: url.hostname, port: url.port || 4200, path: url.pathname, timeout: 5000 }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        try {
+          const agents = JSON.parse(body);
+          const match = agents.find((a) => a.name === nameOrId);
+          if (match) {
+            console.log(`[gateway] Resolved agent "${nameOrId}" → ${match.id}`);
+            resolve(match.id);
+          } else {
+            console.warn(`[gateway] Agent "${nameOrId}" not found, using as-is`);
+            resolve(nameOrId);
+          }
+        } catch {
+          resolve(nameOrId);
+        }
+      });
+    }).on('error', () => resolve(nameOrId));
+  });
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -115,8 +169,17 @@ async function startConnection() {
     }
   });
 
+  // Debug: log key Baileys events
+  for (const evt of ['messages.upsert', 'messages.update', 'messages.delete', 'message-receipt.update', 'messaging-history.set', 'chats.upsert', 'chats.update', 'contacts.upsert', 'contacts.update', 'presence.update', 'groups.upsert', 'groups.update']) {
+    sock.ev.on(evt, (data) => {
+      const count = Array.isArray(data) ? data.length : (data?.messages?.length || data?.chats?.length || '?');
+      console.log(`[gateway] Event: ${evt} (count=${count})`);
+    });
+  }
+
   // Incoming messages → forward to OpenFang
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`[gateway] messages.upsert: type=${type}, count=${messages.length}`);
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -127,21 +190,78 @@ async function startConnection() {
       const remoteJid = msg.key.remoteJid || '';
       const isGroup = remoteJid.endsWith('@g.us');
 
-      let text = msg.message?.conversation
-        || msg.message?.extendedTextMessage?.text
-        || msg.message?.imageMessage?.caption
+      // Unwrap Baileys message wrappers (viewOnce, ephemeral, etc.)
+      const rawMsg = msg.message;
+      const m = rawMsg?.ephemeralMessage?.message
+        || rawMsg?.viewOnceMessage?.message
+        || rawMsg?.viewOnceMessageV2?.message
+        || rawMsg?.viewOnceMessageV2Extension?.message
+        || rawMsg?.documentWithCaptionMessage?.message
+        || rawMsg;
+
+      let text = m?.conversation
+        || m?.extendedTextMessage?.text
         || '';
 
-      // Detect media type if no text
-      if (!text) {
-        const m = msg.message;
-        if (m?.imageMessage) text = '[Image received]' + (m.imageMessage.caption ? ': ' + m.imageMessage.caption : '');
-        else if (m?.audioMessage) text = '[Voice note received]';
-        else if (m?.videoMessage) text = '[Video received]' + (m.videoMessage.caption ? ': ' + m.videoMessage.caption : '');
-        else if (m?.documentMessage) text = '[Document received: ' + (m.documentMessage.fileName || 'file') + ']';
-        else if (m?.stickerMessage) text = '[Sticker received]';
-        else continue; // Only skip truly empty messages
+      // Debug: log message keys to diagnose undetected media
+      const rawKeys = rawMsg ? Object.keys(rawMsg) : [];
+      const unwrappedKeys = m ? Object.keys(m) : [];
+      if (rawKeys.length > 0) {
+        console.log(`[gateway] Message keys: raw=[${rawKeys.join(',')}] unwrapped=[${unwrappedKeys.join(',')}]`);
       }
+
+      // Check for media messages
+      const hasMedia = m?.imageMessage || m?.audioMessage || m?.videoMessage
+        || m?.documentMessage || m?.stickerMessage;
+
+      // Extract caption from media messages
+      if (!text && hasMedia) {
+        text = m?.imageMessage?.caption || m?.videoMessage?.caption || '';
+      }
+
+      // Download and upload media if present
+      let attachments = [];
+      if (hasMedia) {
+        const mediaType = m?.imageMessage ? 'image' : m?.audioMessage ? 'audio' : m?.videoMessage ? 'video' : m?.documentMessage ? 'document' : 'sticker';
+        const wasWrapped = m !== rawMsg;
+        console.log(`[gateway] Media detected: type=${mediaType}, wrapped=${wasWrapped}, from=${msg.pushName || 'unknown'}`);
+        const media = await downloadWhatsAppMedia(msg);
+        if (media) {
+          try {
+            const fileId = await uploadMediaToOpenFang(media.buffer, media.mimetype, media.filename);
+            attachments.push({
+              file_id: fileId,
+              filename: media.filename,
+              content_type: media.mimetype,
+            });
+            // If no text/caption, describe what was sent
+            if (!text) {
+              const type = media.mimetype.split('/')[0]; // image, audio, video
+              text = `[${type} attachment: ${media.filename}]`;
+            }
+          } catch (err) {
+            console.error(`[gateway] Media upload failed:`, err.message);
+            // Fallback to placeholder text
+            if (!text) {
+              if (m?.imageMessage) text = '[Image received - upload failed]';
+              else if (m?.audioMessage) text = '[Voice note received - upload failed]';
+              else if (m?.videoMessage) text = '[Video received - upload failed]';
+              else if (m?.documentMessage) text = '[Document received - upload failed]';
+              else if (m?.stickerMessage) text = '[Sticker received - upload failed]';
+            }
+          }
+        } else if (!text) {
+          // Media download failed, use placeholder
+          if (m?.imageMessage) text = '[Image received - download failed]';
+          else if (m?.audioMessage) text = '[Voice note received - download failed]';
+          else if (m?.videoMessage) text = '[Video received - download failed]';
+          else if (m?.documentMessage) text = '[Document received - download failed]';
+          else if (m?.stickerMessage) text = '[Sticker received - download failed]';
+        }
+      }
+
+      // Skip truly empty messages (no text, no media)
+      if (!text && attachments.length === 0) continue;
 
       // For groups: real sender is in participant; for DMs: it's remoteJid
       const senderJid = isGroup ? (msg.key.participant || '') : remoteJid;
@@ -163,10 +283,11 @@ async function startConnection() {
 
       // Forward to OpenFang agent
       try {
-        const response = await forwardToOpenFang(text, phone, pushName, metadata);
+        const response = await forwardToOpenFang(text, phone, pushName, metadata, attachments);
         if (response && sock) {
           // Reply in the same context: group → group, DM → DM
-          const replyJid = isGroup ? remoteJid : senderJid.replace(/@.*$/, '') + '@s.whatsapp.net';
+          // Use remoteJid directly to preserve @lid JIDs (WhatsApp Linked Identity)
+          const replyJid = remoteJid;
           await sock.sendMessage(replyJid, { text: response });
           console.log(`[gateway] Replied to ${pushName}${isGroup ? ' in group ' + remoteJid : ''}`);
         }
@@ -178,18 +299,126 @@ async function startConnection() {
 }
 
 // ---------------------------------------------------------------------------
+// Upload media to OpenFang, return file_id
+// ---------------------------------------------------------------------------
+async function uploadMediaToOpenFang(buffer, contentType, filename) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${OPENFANG_URL}/api/agents/${encodeURIComponent(DEFAULT_AGENT)}/upload`);
+
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 4200,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': contentType,
+          'Content-Length': buffer.length,
+          'X-Filename': filename,
+        },
+        timeout: 30_000,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk) => (body += chunk));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(body);
+            if (data.file_id) {
+              console.log(`[gateway] Uploaded media: ${filename} → ${data.file_id}`);
+              resolve(data.file_id);
+            } else {
+              reject(new Error(`Upload failed: ${body}`));
+            }
+          } catch {
+            reject(new Error(`Upload parse error: ${body}`));
+          }
+        });
+      },
+    );
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Upload timeout'));
+    });
+    req.write(buffer);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Download media from a WhatsApp message, returns { buffer, mimetype, filename }
+// ---------------------------------------------------------------------------
+async function downloadWhatsAppMedia(msg) {
+  // Unwrap Baileys message wrappers (viewOnce, ephemeral, etc.)
+  const rawMsg = msg.message;
+  const m = rawMsg?.ephemeralMessage?.message
+    || rawMsg?.viewOnceMessage?.message
+    || rawMsg?.viewOnceMessageV2?.message
+    || rawMsg?.viewOnceMessageV2Extension?.message
+    || rawMsg?.documentWithCaptionMessage?.message
+    || rawMsg;
+  let mediaMsg = null;
+  let mimetype = 'application/octet-stream';
+  let filename = 'file';
+
+  if (m?.imageMessage) {
+    mediaMsg = m.imageMessage;
+    mimetype = mediaMsg.mimetype || 'image/jpeg';
+    filename = `image_${Date.now()}.${mimetype.split('/')[1] || 'jpg'}`;
+  } else if (m?.audioMessage) {
+    mediaMsg = m.audioMessage;
+    mimetype = mediaMsg.mimetype || 'audio/ogg';
+    const ext = mediaMsg.ptt ? 'ogg' : (mimetype.split('/')[1] || 'ogg');
+    filename = `audio_${Date.now()}.${ext}`;
+  } else if (m?.videoMessage) {
+    mediaMsg = m.videoMessage;
+    mimetype = mediaMsg.mimetype || 'video/mp4';
+    filename = `video_${Date.now()}.${mimetype.split('/')[1] || 'mp4'}`;
+  } else if (m?.documentMessage) {
+    mediaMsg = m.documentMessage;
+    mimetype = mediaMsg.mimetype || 'application/octet-stream';
+    filename = mediaMsg.fileName || `document_${Date.now()}`;
+  } else if (m?.stickerMessage) {
+    mediaMsg = m.stickerMessage;
+    mimetype = mediaMsg.mimetype || 'image/webp';
+    filename = `sticker_${Date.now()}.webp`;
+  }
+
+  if (!mediaMsg) return null;
+
+  try {
+    // For wrapped messages, create a shallow copy with unwrapped .message
+    // so Baileys' downloadMediaMessage can find the media content
+    const downloadMsg = (m !== rawMsg) ? { ...msg, message: m } : msg;
+    const buffer = await downloadMediaMessage(downloadMsg, 'buffer', {});
+    return { buffer, mimetype, filename };
+  } catch (err) {
+    console.error(`[gateway] Media download failed:`, err.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Forward incoming message to OpenFang API, return agent response
 // ---------------------------------------------------------------------------
-function forwardToOpenFang(text, phone, pushName, metadata) {
+function forwardToOpenFang(text, phone, pushName, metadata, attachments) {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
+    const body = {
       message: text,
+      sender_id: phone,
+      sender_name: pushName,
       metadata: metadata || {
         channel: 'whatsapp',
         sender: phone,
         sender_name: pushName,
       },
-    });
+    };
+    if (attachments && attachments.length > 0) {
+      body.attachments = attachments;
+    }
+    const payload = JSON.stringify(body);
 
     const url = new URL(`${OPENFANG_URL}/api/agents/${encodeURIComponent(DEFAULT_AGENT)}/message`);
 
@@ -203,7 +432,7 @@ function forwardToOpenFang(text, phone, pushName, metadata) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(payload),
         },
-        timeout: 120_000, // LLM calls can be slow
+        timeout: 300_000, // LLM calls can be very slow (5 min)
       },
       (res) => {
         let body = '';
@@ -356,7 +585,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, '127.0.0.1', async () => {
+  // Resolve agent name to UUID before anything else
+  DEFAULT_AGENT = await resolveAgentId(DEFAULT_AGENT);
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
   console.log(`[gateway] OpenFang URL: ${OPENFANG_URL}`);
   console.log(`[gateway] Default agent: ${DEFAULT_AGENT}`);
