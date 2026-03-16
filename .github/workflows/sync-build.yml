@@ -46,8 +46,7 @@ jobs:
           if [ "$LATEST_TAG" != "$CURRENT" ]; then
             echo "NEW_RELEASE=true" >> "$GITHUB_ENV"
             # Reset main to latest tag, cherry-pick our generic fixes
-            git checkout main
-            git reset --hard "$LATEST_TAG"
+            git checkout -B main "$LATEST_TAG"
             # Cherry-pick any commits on main that are ours (not upstream)
             for commit in $(git log origin/main --oneline --format="%H" "$LATEST_TAG"..origin/main 2>/dev/null); do
               git cherry-pick "$commit" --no-commit && git commit -C "$commit" || git cherry-pick --abort || true
