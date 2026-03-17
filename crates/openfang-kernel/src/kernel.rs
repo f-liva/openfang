@@ -1085,7 +1085,9 @@ impl OpenFangKernel {
                                             || disk_manifest.model.model
                                                 != entry.manifest.model.model
                                             || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools;
+                                                != entry.manifest.capabilities.tools
+                                            || disk_manifest.owner_ids
+                                                != entry.manifest.owner_ids;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1843,6 +1845,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                owner_ids: manifest.owner_ids.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2387,6 +2390,7 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                owner_ids: manifest.owner_ids.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
