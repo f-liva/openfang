@@ -42,6 +42,30 @@ let evProcessUnsub = null;
 const MAX_RECONNECT_DELAY = 60_000;
 const pendingReplies = new Map();
 
+// ---------------------------------------------------------------------------
+// Message deduplication — prevents processing the same message multiple times
+// (e.g. after Signal session re-establishment / decryption retry)
+// ---------------------------------------------------------------------------
+const PROCESSED_IDS_PATH = path.join(__dirname, '.processed_ids.json');
+const DEDUP_MAX_SIZE = 500;
+let processedIds = new Set();
+try {
+  const raw = fs.readFileSync(PROCESSED_IDS_PATH, 'utf8');
+  const arr = JSON.parse(raw);
+  if (Array.isArray(arr)) processedIds = new Set(arr.slice(-DEDUP_MAX_SIZE));
+} catch (_) {}
+
+function markProcessed(msgId) {
+  processedIds.add(msgId);
+  // Trim to max size
+  if (processedIds.size > DEDUP_MAX_SIZE) {
+    const arr = [...processedIds];
+    processedIds = new Set(arr.slice(-Math.floor(DEDUP_MAX_SIZE * 0.8)));
+  }
+  // Persist async (non-blocking)
+  fs.writeFile(PROCESSED_IDS_PATH, JSON.stringify([...processedIds]), () => {});
+}
+
 // Per-sender serial queue: ensures only one OpenFang call per sender at a time
 const senderQueues = new Map();
 function enqueueSender(senderJid, fn) {
@@ -193,7 +217,28 @@ async function startConnection() {
         }
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
-        const sender = msg.key.remoteJid || '';
+        // --- Deduplication: skip already-processed messages ---
+        const msgId = msg.key.id;
+        if (processedIds.has(msgId)) {
+          log('info', `Skipping duplicate message ${msgId}`);
+          continue;
+        }
+
+        const remoteJid = msg.key.remoteJid || '';
+        const isGroup = remoteJid.endsWith('@g.us');
+
+        // --- Group message handling ---
+        // Skip all group messages — Ambrogio only handles direct (1:1) chats.
+        // Group messages have remoteJid ending in @g.us.
+        if (isGroup) {
+          log('info', `Skipping group message from ${msg.pushName || 'unknown'} in ${remoteJid} (id=${msgId})`);
+          markProcessed(msgId);
+          continue;
+        }
+
+        // For DM: sender is remoteJid
+        const sender = remoteJid;
+
         let text =
           msg.message?.conversation ||
           msg.message?.extendedTextMessage?.text ||
@@ -230,6 +275,9 @@ async function startConnection() {
           log('info', `No text content in message from ${sender} (stub=${msg.messageStubType || 'none'})`);
           continue;
         }
+
+        // Mark as processed BEFORE forwarding (prevents re-processing on decrypt retry)
+        markProcessed(msgId);
 
         const phone = '+' + sender.replace(/@.*$/, '');
         const pushName = msg.pushName || phone;
