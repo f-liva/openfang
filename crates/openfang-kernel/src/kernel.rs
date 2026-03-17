@@ -1683,7 +1683,7 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
-        let mut session = self
+        let session = self
             .memory
             .get_session(entry.session_id)
             .map_err(KernelError::OpenFang)?
@@ -1696,7 +1696,7 @@ impl OpenFangKernel {
             });
 
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
-        let needs_compact = {
+        let _needs_compact = {
             use openfang_runtime::compactor::{
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
