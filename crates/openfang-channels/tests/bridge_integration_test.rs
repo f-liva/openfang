@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use futures::Stream;
-use openfang_channels::bridge::{BridgeManager, ChannelBridgeHandle};
+use openfang_channels::bridge::{BridgeManager, ChannelBridgeHandle, ChannelContext};
 use openfang_channels::router::AgentRouter;
 use openfang_channels::types::{
     ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
@@ -122,7 +122,12 @@ impl MockHandle {
 
 #[async_trait]
 impl ChannelBridgeHandle for MockHandle {
-    async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
+    async fn send_message_with_context(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        _ctx: ChannelContext,
+    ) -> Result<String, String> {
         self.received
             .lock()
             .unwrap()

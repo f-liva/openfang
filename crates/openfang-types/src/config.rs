@@ -93,6 +93,16 @@ pub struct ChannelOverrides {
     /// Defaults to true. Set to false to suppress automatic reactions (e.g. on Telegram).
     #[serde(default = "default_true")]
     pub lifecycle_reactions: bool,
+    /// Debounce window in milliseconds for batching rapid messages from the same sender.
+    /// When > 0, messages arriving within this window are merged into one dispatch.
+    /// Default: 3000 (3 seconds — batches rapid-fire messages into a single request).
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Maximum debounce wait in milliseconds (safety cap).
+    /// Even if the user keeps typing, dispatch after this many ms from the first message.
+    /// Default: 30000 (30 seconds). Only relevant when debounce_ms > 0.
+    #[serde(default = "default_debounce_max_ms")]
+    pub debounce_max_ms: u64,
 }
 
 impl Default for ChannelOverrides {
@@ -108,6 +118,8 @@ impl Default for ChannelOverrides {
             usage_footer: None,
             typing_mode: None,
             lifecycle_reactions: true,
+            debounce_ms: default_debounce_ms(),
+            debounce_max_ms: default_debounce_max_ms(),
         }
     }
 }
@@ -1253,6 +1265,14 @@ fn default_language() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_debounce_ms() -> u64 {
+    5_000
+}
+
+fn default_debounce_max_ms() -> u64 {
+    30_000
 }
 
 fn default_thread_ttl() -> u64 {
