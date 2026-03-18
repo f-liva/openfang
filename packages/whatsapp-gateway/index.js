@@ -10,6 +10,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -66,15 +67,120 @@ function markProcessed(msgId) {
   fs.writeFile(PROCESSED_IDS_PATH, JSON.stringify([...processedIds]), () => {});
 }
 
-// Per-sender serial queue: ensures only one OpenFang call per sender at a time
-const senderQueues = new Map();
-function enqueueSender(senderJid, fn) {
-  const prev = senderQueues.get(senderJid) || Promise.resolve();
-  const next = prev.then(fn, fn);
-  senderQueues.set(senderJid, next);
-  next.finally(() => {
-    if (senderQueues.get(senderJid) === next) senderQueues.delete(senderJid);
-  });
+// ---------------------------------------------------------------------------
+// Media download & serving — allows forwarding WhatsApp images to OpenFang
+// ---------------------------------------------------------------------------
+const MEDIA_DIR = path.join(__dirname, 'media_cache');
+const MEDIA_MAX_AGE_MS = 30 * 60_000; // 30 minutes
+if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+// Periodic cleanup of expired media files
+setInterval(() => {
+  try {
+    const now = Date.now();
+    for (const f of fs.readdirSync(MEDIA_DIR)) {
+      const fp = path.join(MEDIA_DIR, f);
+      const stat = fs.statSync(fp);
+      if (now - stat.mtimeMs > MEDIA_MAX_AGE_MS) {
+        fs.unlinkSync(fp);
+      }
+    }
+  } catch (_) {}
+}, 5 * 60_000);
+
+const MEDIA_TYPE_MAP = {
+  imageMessage: { ext: 'jpg', label: 'Photo' },
+  videoMessage: { ext: 'mp4', label: 'Video' },
+  stickerMessage: { ext: 'webp', label: 'Sticker' },
+  audioMessage: { ext: 'ogg', label: 'Audio' },
+  documentMessage: { ext: null, label: 'Document' },
+};
+
+/**
+ * Download media from a WhatsApp message, save to disk, return local URL.
+ * Returns { url, label, caption } or null on failure.
+ */
+async function downloadMedia(msg) {
+  const m = msg.message;
+  if (!m) return null;
+
+  for (const [key, info] of Object.entries(MEDIA_TYPE_MAP)) {
+    const media = m[key];
+    if (!media) continue;
+
+    try {
+      const buffer = await downloadMediaMessage(msg, 'buffer', {});
+      const ext = info.ext || (media.fileName?.split('.').pop()) || 'bin';
+      const filename = `${msg.key.id || randomUUID()}.${ext}`;
+      const filePath = path.join(MEDIA_DIR, filename);
+      fs.writeFileSync(filePath, buffer);
+
+      const caption = media.caption || null;
+      const localUrl = `http://127.0.0.1:${PORT}/media/${filename}`;
+
+      log('info', `Downloaded ${info.label} (${buffer.length} bytes) → ${filename}`);
+      return { url: localUrl, label: info.label, caption };
+    } catch (err) {
+      log('error', `Media download failed (${key}): ${err.message}`);
+      return null;
+    }
+  }
+  return null;
+}
+
+// Per-sender message debounce: accumulates rapid messages and sends as one batch.
+// Media messages are buffered IMMEDIATELY (before download) so the debounce timer
+// starts on arrival, not after the slow media download finishes.
+const DEBOUNCE_MS = 5_000; // 5 seconds of silence before flushing
+const DEBOUNCE_MEDIA_MS = 15_000; // 15 seconds when batch contains media (image uploads are slow)
+const senderBuffers = new Map(); // senderJid → { entries: [], timer, replyJid, isGroup, groupJid, wasMentioned, phone, pushName }
+
+function debounceMessage(senderJid, msgData) {
+  let buf = senderBuffers.get(senderJid);
+  if (!buf) {
+    buf = { entries: [], timer: null, replyJid: null, isGroup: false, groupJid: null, wasMentioned: false };
+    senderBuffers.set(senderJid, buf);
+  }
+
+  // Each entry is either a resolved string or a Promise<string> (for pending media downloads)
+  buf.entries.push(msgData.textOrPromise);
+  buf.replyJid = msgData.replyJid;
+  buf.isGroup = msgData.isGroup;
+  buf.groupJid = msgData.groupJid;
+  buf.phone = msgData.phone;
+  buf.pushName = msgData.pushName;
+  if (msgData.wasMentioned) buf.wasMentioned = true;
+
+  // Reset the timer on each new message
+  // Use longer debounce when batch contains media (WhatsApp uploads images one at a time with delays)
+  const hasMedia = buf.entries.some(e => e && typeof e.then === 'function');
+  const effectiveDebounce = hasMedia ? DEBOUNCE_MEDIA_MS : DEBOUNCE_MS;
+  if (buf.timer) clearTimeout(buf.timer);
+  buf.timer = setTimeout(() => flushSenderBuffer(senderJid), effectiveDebounce);
+
+  log('info', `Debounce: buffered msg from ${msgData.pushName} (${buf.entries.length} in batch, flushing in ${effectiveDebounce}ms${hasMedia ? ' [media]' : ''})`);
+}
+
+async function flushSenderBuffer(senderJid) {
+  const buf = senderBuffers.get(senderJid);
+  if (!buf || buf.entries.length === 0) return;
+  senderBuffers.delete(senderJid);
+
+  // Resolve any pending media download promises
+  const resolved = await Promise.all(buf.entries);
+  // Filter out nulls (failed downloads with no text)
+  const texts = resolved.filter(Boolean);
+  if (texts.length === 0) return;
+
+  const combinedText = texts.join('\n');
+  const count = texts.length;
+  log('info', `Debounce flush: ${count} message(s) from ${buf.pushName} → single OpenFang call`);
+
+  try {
+    await handleIncoming(combinedText, buf.phone, buf.pushName, buf.replyJid, buf.isGroup, buf.groupJid, buf.wasMentioned);
+  } catch (err) {
+    log('error', `Debounce flush failed for ${buf.pushName}: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,17 +333,11 @@ async function startConnection() {
         const remoteJid = msg.key.remoteJid || '';
         const isGroup = remoteJid.endsWith('@g.us');
 
-        // --- Group message handling ---
-        // Skip all group messages — Ambrogio only handles direct (1:1) chats.
-        // Group messages have remoteJid ending in @g.us.
-        if (isGroup) {
-          log('info', `Skipping group message from ${msg.pushName || 'unknown'} in ${remoteJid} (id=${msgId})`);
-          markProcessed(msgId);
-          continue;
-        }
-
-        // For DM: sender is remoteJid
-        const sender = remoteJid;
+        // In groups, the actual sender is in msg.key.participant;
+        // in DMs, the sender is remoteJid itself.
+        const sender = isGroup
+          ? (msg.key.participant || remoteJid)
+          : remoteJid;
 
         let text =
           msg.message?.conversation ||
@@ -246,8 +346,26 @@ async function startConnection() {
           msg.message?.videoMessage?.caption ||
           '';
 
+        // Detect if this is a media message that needs async download
+        let mediaPromise = null;
+        const hasMediaKey = !text && Object.keys(MEDIA_TYPE_MAP).some(k => msg.message?.[k]);
+
+        if (hasMediaKey) {
+          // Start download in background — do NOT await here.
+          // The promise resolves to a text string (or null on failure).
+          mediaPromise = downloadMedia(msg).then(media => {
+            if (!media) return null;
+            return media.caption
+              ? `[${media.label}: ${media.url}]\n${media.caption}`
+              : `[${media.label}: ${media.url}]`;
+          }).catch(err => {
+            log('error', `Async media download failed: ${err.message}`);
+            return null;
+          });
+        }
+
         // vCard / contact message support
-        if (!text && msg.message?.contactMessage) {
+        if (!text && !hasMediaKey && msg.message?.contactMessage) {
           const vc = msg.message.contactMessage;
           const vcardStr = vc.vcard || '';
           // Extract name from displayName or vCard FN field
@@ -259,7 +377,7 @@ async function startConnection() {
         }
 
         // Multi-contact message (contactsArrayMessage)
-        if (!text && msg.message?.contactsArrayMessage) {
+        if (!text && !hasMediaKey && msg.message?.contactsArrayMessage) {
           const contacts = msg.message.contactsArrayMessage.contacts || [];
           const entries = contacts.map(c => {
             const vcardStr = c.vcard || '';
@@ -271,7 +389,7 @@ async function startConnection() {
           log('info', `Multi-vCard received from ${sender}: ${entries.length} contacts`);
         }
 
-        if (!text) {
+        if (!text && !mediaPromise) {
           log('info', `No text content in message from ${sender} (stub=${msg.messageStubType || 'none'})`);
           continue;
         }
@@ -282,7 +400,21 @@ async function startConnection() {
         const phone = '+' + sender.replace(/@.*$/, '');
         const pushName = msg.pushName || phone;
 
-        log('info', `Incoming from ${pushName} (${phone}): ${text.substring(0, 120)}`);
+        // Detect @mention of the bot in groups
+        let wasMentioned = false;
+        if (isGroup && sock?.user?.id) {
+          const botJid = sock.user.id.replace(/:\d+@/, '@'); // normalize "123:45@s.whatsapp.net" → "123@s.whatsapp.net"
+          const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+          wasMentioned = mentionedJids.includes(botJid) || mentionedJids.includes(sock.user.id);
+          // Also check raw text for @phone patterns
+          if (!wasMentioned) {
+            const botPhone = botJid.replace(/@.*$/, '');
+            wasMentioned = (text || '').includes(`@${botPhone}`);
+          }
+        }
+
+        const groupLabel = isGroup ? ` [group:${remoteJid}]` : '';
+        log('info', `Incoming from ${pushName} (${phone})${groupLabel}: ${(text || '[media downloading]').substring(0, 120)}`);
 
         // Read receipt (blue ticks)
         try {
@@ -291,12 +423,13 @@ async function startConnection() {
           log('error', `Read receipt failed: ${err.message}`);
         }
 
-        // Enqueue per-sender to serialize OpenFang calls per contact
-        enqueueSender(sender, () =>
-          handleIncoming(text, phone, pushName, sender).catch((err) => {
-            log('error', `Handle failed for ${pushName}: ${err.message}`);
-          })
-        );
+        // In groups, reply to the group; in DMs, reply to the individual.
+        const replyJid = isGroup ? remoteJid : sender;
+
+        // Debounce: accumulate rapid messages from same sender, flush after 5s of silence.
+        // For media messages, pass the download promise so debounce starts NOW (not after download).
+        const textOrPromise = mediaPromise || text;
+        debounceMessage(sender, { textOrPromise, phone, pushName, replyJid, isGroup, groupJid: remoteJid, wasMentioned });
       }
     }
   });
@@ -385,10 +518,10 @@ async function handleConnectionUpdate(update) {
 // ---------------------------------------------------------------------------
 // Handle incoming → OpenFang → reply
 // ---------------------------------------------------------------------------
-async function handleIncoming(text, phone, pushName, senderJid) {
+async function handleIncoming(text, phone, pushName, replyJid, isGroup, groupJid, wasMentioned) {
   let response;
   try {
-    response = await forwardToOpenFang(text, phone, pushName);
+    response = await forwardToOpenFang(text, phone, pushName, isGroup, groupJid, wasMentioned);
   } catch (err) {
     log('error', `OpenFang error for ${pushName}: ${err.message}`);
     return;
@@ -403,8 +536,9 @@ async function handleIncoming(text, phone, pushName, senderJid) {
 
   if (sock && connStatus === 'connected') {
     try {
-      await sock.sendMessage(senderJid, { text: response });
-      log('info', `Replied to ${pushName} (${response.length} chars)`);
+      await sock.sendMessage(replyJid, { text: response });
+      const target = isGroup ? `group ${groupJid}` : pushName;
+      log('info', `Replied to ${target} (${response.length} chars)`);
       return;
     } catch (err) {
       log('error', `Send failed for ${pushName}: ${err.message}`);
@@ -412,7 +546,7 @@ async function handleIncoming(text, phone, pushName, senderJid) {
   }
 
   log('info', `Buffering reply for ${pushName}`);
-  pendingReplies.set(senderJid, { text: response, timestamp: Date.now() });
+  pendingReplies.set(replyJid, { text: response, timestamp: Date.now() });
 }
 
 // ---------------------------------------------------------------------------
@@ -473,14 +607,21 @@ async function resolveAgentUUID(nameOrUUID) {
 // ---------------------------------------------------------------------------
 // Forward to OpenFang
 // ---------------------------------------------------------------------------
-async function forwardToOpenFang(text, phone, pushName) {
+async function forwardToOpenFang(text, phone, pushName, isGroup, groupJid, wasMentioned) {
   const agentId = await resolveAgentUUID(DEFAULT_AGENT);
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
+    const body = {
       message: text,
       sender_id: phone,
       sender_name: pushName,
-    });
+      channel_type: 'whatsapp',
+    };
+    if (isGroup) {
+      body.is_group = true;
+      body.group_id = groupJid;
+      body.was_mentioned = wasMentioned;
+    }
+    const payload = JSON.stringify(body);
     const url = new URL(`${OPENFANG_URL}/api/agents/${agentId}/message`);
     const req = http.request(
       {
@@ -595,6 +736,21 @@ const server = http.createServer(async (req, res) => {
       if (!body.to || !body.text) return jsonResponse(res, 400, { error: 'Missing "to" or "text"' });
       await sendMessage(body.to, body.text);
       return jsonResponse(res, 200, { success: true, message: 'Sent' });
+    }
+
+    // Serve cached media files
+    if (req.method === 'GET' && pathname.startsWith('/media/')) {
+      const filename = path.basename(pathname);
+      const filePath = path.join(MEDIA_DIR, filename);
+      if (fs.existsSync(filePath)) {
+        const ext = path.extname(filename).slice(1);
+        const mimeMap = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', mp4: 'video/mp4', ogg: 'audio/ogg', pdf: 'application/pdf' };
+        const contentType = mimeMap[ext] || 'application/octet-stream';
+        const data = fs.readFileSync(filePath);
+        res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': data.length });
+        return res.end(data);
+      }
+      return jsonResponse(res, 404, { error: 'Media not found' });
     }
 
     if (req.method === 'GET' && pathname === '/health') {
