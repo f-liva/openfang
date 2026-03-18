@@ -258,17 +258,12 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                self.client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)
                     .send()
                     .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(format!("WhatsApp API error {status}: {body}").into());
-                }
             }
             ChannelContent::File { url, filename } => {
                 let body = serde_json::json!({
@@ -284,17 +279,12 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                self.client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)
                     .send()
                     .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(format!("WhatsApp API error {status}: {body}").into());
-                }
             }
             ChannelContent::Location { lat, lon } => {
                 let body = serde_json::json!({
@@ -310,17 +300,12 @@ impl ChannelAdapter for WhatsAppAdapter {
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
                 );
-                let resp = self.client
+                self.client
                     .post(&api_url)
                     .bearer_auth(&*self.access_token)
                     .json(&body)
                     .send()
                     .await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(format!("WhatsApp API error {status}: {body}").into());
-                }
             }
             _ => {
                 self.api_send_message(&user.platform_id, "(Unsupported content type)")
