@@ -7,7 +7,7 @@ use crate::formatter;
 use crate::router::AgentRouter;
 use crate::types::{
     default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
-    LifecycleReaction,
+    LifecycleReaction, TypingEvent,
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -15,9 +15,10 @@ use futures::StreamExt;
 use openfang_types::agent::AgentId;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
 use openfang_types::message::ContentBlock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 /// Channel context passed from channel bridges to the kernel alongside messages.
@@ -303,6 +304,338 @@ impl ChannelRateLimiter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Message debouncer — batches rapid messages from the same sender
+// ---------------------------------------------------------------------------
+
+/// A buffered message pending dispatch.
+struct PendingMessage {
+    message: ChannelMessage,
+    /// Content blocks (images) associated with this message, if any.
+    image_blocks: Option<Vec<ContentBlock>>,
+}
+
+/// Per-sender buffer state.
+struct SenderBuffer {
+    /// Accumulated messages (in arrival order).
+    messages: Vec<PendingMessage>,
+    /// When the first message in this batch arrived.
+    first_arrived: Instant,
+    /// Handle to the active debounce timer task (cancelled on new message).
+    timer_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Batches rapid-fire messages from the same sender before dispatching.
+///
+/// When `debounce_ms` > 0, incoming messages are buffered per sender key
+/// (`channel_type:platform_id`). A timer starts on the first message; each
+/// subsequent message resets the timer. When the timer fires (no new messages
+/// for `debounce_ms`) or the safety cap (`debounce_max_ms`) is reached, all
+/// buffered messages are merged and dispatched as a single request.
+struct MessageDebouncer {
+    debounce_ms: u64,
+    debounce_max_ms: u64,
+    /// Sender for "flush this key" signals.
+    flush_tx: mpsc::UnboundedSender<String>,
+}
+
+impl MessageDebouncer {
+    fn new(debounce_ms: u64, debounce_max_ms: u64) -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                debounce_ms,
+                debounce_max_ms,
+                flush_tx,
+            },
+            flush_rx,
+        )
+    }
+
+    /// Returns true if debouncing is enabled.
+    #[allow(dead_code)]
+    fn is_enabled(&self) -> bool {
+        self.debounce_ms > 0
+    }
+
+    /// Push a message into the buffer and (re)start the debounce timer.
+    fn push(
+        &self,
+        key: &str,
+        pending: PendingMessage,
+        buffers: &mut HashMap<String, SenderBuffer>,
+    ) {
+        let debounce_dur = Duration::from_millis(self.debounce_ms);
+        let max_dur = Duration::from_millis(self.debounce_max_ms);
+
+        let buf = buffers.entry(key.to_string()).or_insert_with(|| SenderBuffer {
+            messages: Vec::new(),
+            first_arrived: Instant::now(),
+            timer_handle: None,
+        });
+
+        buf.messages.push(pending);
+
+        // Cancel any existing timer
+        if let Some(handle) = buf.timer_handle.take() {
+            handle.abort();
+        }
+
+        // Check safety cap — if we've waited long enough, flush immediately
+        let elapsed = buf.first_arrived.elapsed();
+        if elapsed >= max_dur {
+            debug!(
+                sender = key,
+                "Debounce safety cap reached ({:.1}s), flushing immediately",
+                elapsed.as_secs_f64()
+            );
+            let _ = self.flush_tx.send(key.to_string());
+            return;
+        }
+
+        // Start a new timer
+        let remaining_cap = max_dur.saturating_sub(elapsed);
+        let delay = debounce_dur.min(remaining_cap);
+        let flush_tx = self.flush_tx.clone();
+        let flush_key = key.to_string();
+        buf.timer_handle = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = flush_tx.send(flush_key);
+        }));
+    }
+
+    /// Handle a typing indicator event.
+    ///
+    /// When `is_typing: true` and the sender has buffered messages, cancel the
+    /// debounce timer (don't flush yet — user is still composing). When
+    /// `is_typing: false`, restart the normal debounce timer. The safety cap
+    /// (`debounce_max_ms`) always applies regardless of typing state.
+    fn on_typing(
+        &self,
+        key: &str,
+        is_typing: bool,
+        buffers: &mut HashMap<String, SenderBuffer>,
+    ) {
+        let Some(buf) = buffers.get_mut(key) else {
+            return; // No buffered messages for this sender — ignore
+        };
+
+        // Safety cap always applies
+        let max_dur = Duration::from_millis(self.debounce_max_ms);
+        let elapsed = buf.first_arrived.elapsed();
+        if elapsed >= max_dur {
+            debug!(
+                sender = key,
+                "Debounce safety cap reached during typing ({:.1}s), flushing",
+                elapsed.as_secs_f64()
+            );
+            let _ = self.flush_tx.send(key.to_string());
+            return;
+        }
+
+        if is_typing {
+            // User is typing — cancel any running timer, wait for more messages
+            if let Some(handle) = buf.timer_handle.take() {
+                handle.abort();
+                debug!(sender = key, "Typing detected, debounce timer paused");
+            }
+        } else {
+            // User stopped typing — restart the debounce timer
+            if let Some(handle) = buf.timer_handle.take() {
+                handle.abort();
+            }
+            let remaining_cap = max_dur.saturating_sub(elapsed);
+            let delay = Duration::from_millis(self.debounce_ms).min(remaining_cap);
+            let flush_tx = self.flush_tx.clone();
+            let flush_key = key.to_string();
+            buf.timer_handle = Some(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = flush_tx.send(flush_key);
+            }));
+            debug!(sender = key, "Typing stopped, debounce timer restarted ({delay:?})");
+        }
+    }
+
+    /// Drain a sender's buffer and merge messages into a single dispatch payload.
+    ///
+    /// Returns (merged text parts, merged content blocks, first ChannelMessage as context).
+    fn drain(
+        &self,
+        key: &str,
+        buffers: &mut HashMap<String, SenderBuffer>,
+    ) -> Option<(ChannelMessage, Option<Vec<ContentBlock>>)> {
+        let buf = buffers.remove(key)?;
+        if buf.messages.is_empty() {
+            return None;
+        }
+
+        let count = buf.messages.len();
+        let mut messages = buf.messages;
+
+        // Single message — no merging needed
+        if count == 1 {
+            let pm = messages.remove(0);
+            return Some((pm.message, pm.image_blocks));
+        }
+
+        debug!(
+            sender = key,
+            count, "Merging {count} debounced messages into single dispatch"
+        );
+
+        // Use the first message as the "representative" for routing/metadata
+        let first = messages.remove(0);
+        let mut merged_msg = first.message;
+        let mut all_blocks: Vec<ContentBlock> = Vec::new();
+
+        // Collect blocks from the first message
+        if let Some(blocks) = first.image_blocks {
+            all_blocks.extend(blocks);
+        }
+
+        // Extract text from the first message's content
+        let mut text_parts: Vec<String> = Vec::new();
+        text_parts.push(content_to_text(&merged_msg.content));
+
+        // Merge remaining messages
+        for pm in messages {
+            text_parts.push(content_to_text(&pm.message.content));
+            if let Some(blocks) = pm.image_blocks {
+                all_blocks.extend(blocks);
+            }
+        }
+
+        // Replace content with merged text
+        let merged_text = text_parts.join("\n");
+        merged_msg.content = ChannelContent::Text(merged_text);
+
+        let blocks = if all_blocks.is_empty() {
+            None
+        } else {
+            Some(all_blocks)
+        };
+
+        Some((merged_msg, blocks))
+    }
+}
+
+/// Extract text representation from any ChannelContent variant.
+fn content_to_text(content: &ChannelContent) -> String {
+    match content {
+        ChannelContent::Text(t) => t.clone(),
+        ChannelContent::Command { name, args } => {
+            if args.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{name} {}", args.join(" "))
+            }
+        }
+        ChannelContent::Image { url, caption } => match caption {
+            Some(c) => format!("[Photo: {url}]\n{c}"),
+            None => format!("[Photo: {url}]"),
+        },
+        ChannelContent::File { url, filename } => format!("[File ({filename}): {url}]"),
+        ChannelContent::Voice { url, duration_seconds } => {
+            format!("[Voice message ({duration_seconds}s): {url}]")
+        }
+        ChannelContent::Location { lat, lon } => format!("[Location: {lat}, {lon}]"),
+        ChannelContent::FileData { filename, .. } => format!("[File: {filename}]"),
+    }
+}
+
+/// Drain a sender's debounce buffer and spawn a dispatch task for the merged message.
+///
+/// Called when the debounce timer fires (sender stopped typing) or the safety cap is
+/// reached. Drains all buffered messages for `key`, merges them, and dispatches the
+/// result as a single request — either via `dispatch_with_blocks` (if images were
+/// pre-downloaded) or via `dispatch_message` (text-only).
+#[allow(clippy::too_many_arguments)]
+fn flush_debounced(
+    debouncer: &MessageDebouncer,
+    key: &str,
+    buffers: &mut HashMap<String, SenderBuffer>,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    router: &Arc<AgentRouter>,
+    adapter: &Arc<dyn ChannelAdapter>,
+    rate_limiter: &ChannelRateLimiter,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) {
+    let Some((merged_msg, blocks)) = debouncer.drain(key, buffers) else {
+        return;
+    };
+
+    let handle = handle.clone();
+    let router = router.clone();
+    let adapter = adapter.clone();
+    let rate_limiter = rate_limiter.clone();
+    let sem = semaphore.clone();
+
+    tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if let Some(mut blocks) = blocks {
+            // Has pre-downloaded image blocks — build combined block list with text.
+            // Prepend any text content so the LLM sees the user's messages alongside images.
+            let text = content_to_text(&merged_msg.content);
+            if !text.is_empty() {
+                blocks.insert(
+                    0,
+                    ContentBlock::Text {
+                        text,
+                        provider_metadata: None,
+                    },
+                );
+            }
+
+            let ct_str = channel_type_str(&merged_msg.channel);
+            let overrides = handle.channel_overrides(ct_str).await;
+            let channel_default_format = default_output_format_for_channel(ct_str);
+            let output_format = overrides
+                .as_ref()
+                .and_then(|o| o.output_format)
+                .unwrap_or(channel_default_format);
+            let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
+            let lifecycle_reactions = overrides
+                .as_ref()
+                .map(|o| o.lifecycle_reactions)
+                .unwrap_or(true);
+            let thread_id = if threading_enabled {
+                merged_msg.thread_id.as_deref()
+            } else {
+                None
+            };
+
+            dispatch_with_blocks(
+                blocks,
+                &merged_msg,
+                &handle,
+                &router,
+                adapter.as_ref(),
+                &adapter,
+                ct_str,
+                thread_id,
+                output_format,
+                lifecycle_reactions,
+            )
+            .await;
+        } else {
+            // Text-only — use standard dispatch (handles commands, routing, etc.)
+            dispatch_message(
+                &merged_msg,
+                &handle,
+                &router,
+                adapter.as_ref(),
+                &adapter,
+                &rate_limiter,
+            )
+            .await;
+        }
+    });
+}
+
 /// Owns all running channel adapters and dispatches messages to agents.
 pub struct BridgeManager {
     handle: Arc<dyn ChannelBridgeHandle>,
@@ -339,6 +672,11 @@ impl BridgeManager {
     /// begin processing immediately. Per-agent serialization (to prevent session
     /// corruption) is handled by the kernel's `agent_msg_locks`.
     ///
+    /// When debounce is enabled (per-channel `debounce_ms > 0`), rapid messages
+    /// from the same sender are buffered and merged into a single dispatch. This
+    /// prevents multiple conflicting responses when a user sends a burst of
+    /// messages (common on Telegram/WhatsApp where images are separate messages).
+    ///
     /// A semaphore limits concurrent dispatch tasks to prevent unbounded memory
     /// growth under burst traffic.
     pub async fn start_adapter(
@@ -356,47 +694,186 @@ impl BridgeManager {
         // 32 is generous — most setups have 1-5 concurrent users.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
+        // Fetch debounce config for this channel type
+        let ct_str = channel_type_str(&adapter.channel_type()).to_string();
+        let overrides = handle.channel_overrides(&ct_str).await;
+        let debounce_ms = overrides.as_ref().map(|o| o.debounce_ms).unwrap_or(0);
+        let debounce_max_ms = overrides
+            .as_ref()
+            .map(|o| o.debounce_max_ms)
+            .unwrap_or(30_000);
+
+        if debounce_ms > 0 {
+            info!(
+                channel = %ct_str,
+                debounce_ms, debounce_max_ms, "Message debouncing enabled"
+            );
+        }
+
         let task = tokio::spawn(async move {
             let mut stream = std::pin::pin!(stream);
-            loop {
-                tokio::select! {
-                    msg = stream.next() => {
-                        match msg {
-                            Some(message) => {
-                                // Spawn each dispatch as a concurrent task so the stream
-                                // loop is never blocked by slow LLM calls. The kernel's
-                                // per-agent lock ensures session integrity.
-                                let handle = handle.clone();
-                                let router = router.clone();
-                                let adapter = adapter_clone.clone();
-                                let rate_limiter = rate_limiter.clone();
-                                let sem = semaphore.clone();
-                                tokio::spawn(async move {
-                                    // Acquire semaphore permit (blocks if 32 tasks are in flight).
-                                    let _permit = match sem.acquire().await {
-                                        Ok(p) => p,
-                                        Err(_) => return, // semaphore closed — shutting down
-                                    };
-                                    dispatch_message(
-                                        &message,
-                                        &handle,
-                                        &router,
-                                        adapter.as_ref(),
-                                        &adapter,
-                                        &rate_limiter,
-                                    ).await;
-                                });
+
+            if debounce_ms == 0 {
+                // --- Fast path: no debouncing, immediate dispatch ---
+                loop {
+                    tokio::select! {
+                        msg = stream.next() => {
+                            match msg {
+                                Some(message) => {
+                                    let handle = handle.clone();
+                                    let router = router.clone();
+                                    let adapter = adapter_clone.clone();
+                                    let rate_limiter = rate_limiter.clone();
+                                    let sem = semaphore.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = match sem.acquire().await {
+                                            Ok(p) => p,
+                                            Err(_) => return,
+                                        };
+                                        dispatch_message(
+                                            &message,
+                                            &handle,
+                                            &router,
+                                            adapter.as_ref(),
+                                            &adapter,
+                                            &rate_limiter,
+                                        ).await;
+                                    });
+                                }
+                                None => {
+                                    info!("Channel adapter {} stream ended", adapter_clone.name());
+                                    break;
+                                }
                             }
-                            None => {
-                                info!("Channel adapter {} stream ended", adapter_clone.name());
+                        }
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("Shutting down channel adapter {}", adapter_clone.name());
                                 break;
                             }
                         }
                     }
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            info!("Shutting down channel adapter {}", adapter_clone.name());
-                            break;
+                }
+            } else {
+                // --- Debounce path: buffer messages per sender, flush on timer ---
+                let (debouncer, mut flush_rx) =
+                    MessageDebouncer::new(debounce_ms, debounce_max_ms);
+                let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+
+                // Subscribe to typing events if the adapter supports them
+                let mut typing_rx = adapter_clone.typing_events();
+                let has_typing = typing_rx.is_some();
+                if has_typing {
+                    info!(
+                        channel = %ct_str,
+                        "Typing-aware debounce enabled"
+                    );
+                }
+
+                loop {
+                    // Use a helper macro-like approach: if typing_rx is None,
+                    // the typing branch will never fire (recv on None -> pending forever).
+                    tokio::select! {
+                        msg = stream.next() => {
+                            match msg {
+                                Some(message) => {
+                                    let sender_key = format!(
+                                        "{}:{}",
+                                        channel_type_str(&message.channel),
+                                        message.sender.platform_id
+                                    );
+
+                                    // Try to download image blocks immediately (so the
+                                    // download happens in parallel with the debounce wait).
+                                    let image_blocks = if let ChannelContent::Image {
+                                        ref url,
+                                        ref caption,
+                                    } = message.content
+                                    {
+                                        let blocks =
+                                            download_image_to_blocks(url, caption.as_deref())
+                                                .await;
+                                        if blocks
+                                            .iter()
+                                            .any(|b| matches!(b, ContentBlock::Image { .. }))
+                                        {
+                                            Some(blocks)
+                                        } else {
+                                            None // download failed, will fall back to text
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    let pending = PendingMessage {
+                                        message,
+                                        image_blocks,
+                                    };
+
+                                    debug!(
+                                        sender = %sender_key,
+                                        "Buffering message (debounce {}ms)",
+                                        debounce_ms
+                                    );
+                                    debouncer.push(&sender_key, pending, &mut buffers);
+                                }
+                                None => {
+                                    // Stream ended — flush all remaining buffers
+                                    let keys: Vec<String> =
+                                        buffers.keys().cloned().collect();
+                                    for key in keys {
+                                        flush_debounced(
+                                            &debouncer,
+                                            &key,
+                                            &mut buffers,
+                                            &handle,
+                                            &router,
+                                            &adapter_clone,
+                                            &rate_limiter,
+                                            &semaphore,
+                                        );
+                                    }
+                                    info!(
+                                        "Channel adapter {} stream ended",
+                                        adapter_clone.name()
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Some(event) = async {
+                            match typing_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending::<Option<TypingEvent>>().await,
+                            }
+                        } => {
+                            let sender_key = format!(
+                                "{}:{}",
+                                channel_type_str(&event.channel),
+                                event.sender.platform_id
+                            );
+                            debouncer.on_typing(&sender_key, event.is_typing, &mut buffers);
+                        }
+                        Some(key) = flush_rx.recv() => {
+                            flush_debounced(
+                                &debouncer,
+                                &key,
+                                &mut buffers,
+                                &handle,
+                                &router,
+                                &adapter_clone,
+                                &rate_limiter,
+                                &semaphore,
+                            );
+                        }
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!(
+                                    "Shutting down channel adapter {}",
+                                    adapter_clone.name()
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -1743,7 +2220,12 @@ mod tests {
 
     #[async_trait]
     impl ChannelBridgeHandle for MockHandle {
-        async fn send_message(&self, _agent_id: AgentId, message: &str) -> Result<String, String> {
+        async fn send_message_with_context(
+            &self,
+            _agent_id: AgentId,
+            message: &str,
+            _ctx: ChannelContext,
+        ) -> Result<String, String> {
             Ok(format!("Echo: {message}"))
         }
         async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
@@ -2027,5 +2509,123 @@ mod tests {
             media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"),
             "image/jpeg"
         );
+    }
+
+    /// Helper to create a minimal PendingMessage for debouncer tests.
+    fn test_pending(text: &str) -> PendingMessage {
+        PendingMessage {
+            message: ChannelMessage {
+                channel: ChannelType::Telegram,
+                platform_message_id: "1".to_string(),
+                sender: ChannelUser {
+                    platform_id: "user1".to_string(),
+                    display_name: "Test".to_string(),
+                    openfang_user: None,
+                },
+                content: ChannelContent::Text(text.to_string()),
+                target_agent: None,
+                timestamp: chrono::Utc::now(),
+                is_group: false,
+                thread_id: None,
+                metadata: HashMap::new(),
+            },
+            image_blocks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_typing_pauses_timer() {
+        let (debouncer, mut flush_rx) = MessageDebouncer::new(200, 30_000);
+        let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+        let key = "telegram:user1";
+
+        // Push a message — starts a 200ms timer
+        debouncer.push(key, test_pending("hello"), &mut buffers);
+        assert!(buffers.contains_key(key));
+        assert!(buffers[key].timer_handle.is_some());
+
+        // Typing event arrives — should cancel the timer
+        debouncer.on_typing(key, true, &mut buffers);
+        assert!(buffers[key].timer_handle.is_none());
+
+        // Wait longer than debounce_ms — should NOT flush because typing paused it
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(flush_rx.try_recv().is_err()); // No flush signal
+
+        // Typing stops — should restart the timer
+        debouncer.on_typing(key, false, &mut buffers);
+        assert!(buffers[key].timer_handle.is_some());
+
+        // Now the timer should fire after debounce_ms
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let flushed_key = flush_rx.try_recv().unwrap();
+        assert_eq!(flushed_key, key);
+    }
+
+    #[tokio::test]
+    async fn test_on_typing_safety_cap_fires() {
+        // Safety cap of 100ms — typing should NOT prevent flush past the cap
+        let (debouncer, mut flush_rx) = MessageDebouncer::new(50, 100);
+        let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+        let key = "telegram:user1";
+
+        debouncer.push(key, test_pending("hello"), &mut buffers);
+
+        // Start typing (pauses timer)
+        debouncer.on_typing(key, true, &mut buffers);
+
+        // Wait until safety cap is exceeded
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Another typing event should trigger safety cap flush
+        debouncer.on_typing(key, true, &mut buffers);
+
+        let flushed_key = flush_rx.try_recv().unwrap();
+        assert_eq!(flushed_key, key);
+    }
+
+    #[tokio::test]
+    async fn test_on_typing_no_buffered_messages_ignored() {
+        let (debouncer, mut flush_rx) = MessageDebouncer::new(200, 30_000);
+        let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+        let key = "telegram:user1";
+
+        // Typing event with no buffered messages — should be a no-op
+        debouncer.on_typing(key, true, &mut buffers);
+        debouncer.on_typing(key, false, &mut buffers);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(flush_rx.try_recv().is_err());
+        assert!(!buffers.contains_key(key));
+    }
+
+    #[tokio::test]
+    async fn test_on_typing_message_after_typing_stop_restarts_timer() {
+        let (debouncer, mut flush_rx) = MessageDebouncer::new(200, 30_000);
+        let mut buffers: HashMap<String, SenderBuffer> = HashMap::new();
+        let key = "telegram:user1";
+
+        // Push message, typing starts, typing stops
+        debouncer.push(key, test_pending("first"), &mut buffers);
+        debouncer.on_typing(key, true, &mut buffers);
+        debouncer.on_typing(key, false, &mut buffers);
+
+        // Push another message after typing stopped — should reset the timer
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        debouncer.push(key, test_pending("second"), &mut buffers);
+
+        // Wait for debounce
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let flushed_key = flush_rx.try_recv().unwrap();
+        assert_eq!(flushed_key, key);
+
+        // Drain should contain both messages
+        let (merged, _) = debouncer.drain(key, &mut buffers).unwrap();
+        if let ChannelContent::Text(text) = &merged.content {
+            assert!(text.contains("first"));
+            assert!(text.contains("second"));
+        } else {
+            panic!("Expected merged text content");
+        }
     }
 }

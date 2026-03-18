@@ -315,6 +315,15 @@ impl ChannelAdapter for WhatsAppAdapter {
         Ok(())
     }
 
+    // TODO(#728): Emit TypingEvent for WhatsApp presence detection.
+    // The Baileys-based WhatsApp Web gateway can expose `presence.update` events
+    // with `composing`/`paused` states. When the gateway adds a `/presence/subscribe`
+    // or WebSocket stream for presence events, implement `typing_events()` here to
+    // return an mpsc::Receiver<TypingEvent> that maps:
+    //   - `composing` → TypingEvent { is_typing: true, ... }
+    //   - `paused`    → TypingEvent { is_typing: false, ... }
+    // The Cloud API does not support reading user presence/typing status.
+
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
